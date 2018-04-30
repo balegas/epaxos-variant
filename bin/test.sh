@@ -17,6 +17,15 @@ DIFF_TOOL=diff
 
 failure=3
 
+#HACKS
+mkdir -p logs
+if [[ $OSTYPE == 'darwin17' ]];
+then
+    PS_AUX="ps aux"
+else
+    PS_AUX="ps -aux"
+fi
+
 master() {
     touch ${LOGS}/m.txt
     ${MASTER} -N ${NSERVERS} > "${LOGS}/m.txt" 2>&1 &
@@ -74,9 +83,9 @@ clients() {
 stop_all() {
     echo ">>>>> Stopping All"
     for p in ${CLIENT} ${SERVER} ${MASTER}; do
-	ps -aux | grep ${p} | awk '{ print $2 }' | xargs kill -9 >& /dev/null
+	$PS_AUX | grep ${p} | awk '{ print $2 }' | xargs kill -9 >& /dev/null
     done
-    ps -aux | grep "tail -f ${LOGS}/m.txt" | awk '{ print $2 }' | xargs kill -9 >& /dev/null
+    $PS_AUX | grep "tail -f ${LOGS}/m.txt" | awk '{ print $2 }' | xargs kill -9 >& /dev/null
     true
 }
 
