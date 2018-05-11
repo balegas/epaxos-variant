@@ -30,6 +30,14 @@ type Command struct {
 	V  Value
 }
 
+
+type FullCmds struct {
+	C [][]Command
+	D [][]Id
+}
+
+type Id int64
+
 func NOOP() []Command {return []Command {{NONE, 0, NIL()}}}
 
 type State struct {

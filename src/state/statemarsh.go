@@ -3,6 +3,8 @@ package state
 import (
 	"encoding/binary"
 	"io"
+	"bytes"
+	"encoding/gob"
 )
 
 func (t *Command) Marshal(w io.Writer) {
@@ -13,21 +15,49 @@ func (t *Command) Marshal(w io.Writer) {
 
 func (t *Command) Unmarshal(r io.Reader) error {
 
-	err := t.Op.Unmarshal(r)
-	if err!=nil{
-		return err
-	}
+    err := t.Op.Unmarshal(r)
+    if err!=nil{
+        return err
+    }
 
-	err = t.K.Unmarshal(r)
-	if err!=nil{
-		return err
-	}
+    err = t.K.Unmarshal(r)
+    if err!=nil{
+        return err
+    }
 
-	err = t.V.Unmarshal(r)
-	if err!=nil{
-		return err
-	}
+    err = t.V.Unmarshal(r)
+    if err!=nil{
+        return err
+    }
 
+    return nil
+}
+
+func (f *FullCmds) Marshal(w io.Writer) {
+    var buf bytes.Buffer
+    enc := gob.NewEncoder(&buf)
+    enc.Encode(f.C)
+    enc.Encode(f.D)
+    w.Write(buf.Bytes())
+}
+
+func (f *FullCmds) Unmarshal(r io.Reader) error {
+    dec := gob.NewDecoder(r)
+    dec.Decode(&f.C)
+    dec.Decode(&f.D)
+    return nil
+}
+
+func (i *Id) Marshal(w io.Writer) {
+	var buf bytes.Buffer
+	enc := gob.NewEncoder(&buf)
+	enc.Encode(i)
+	w.Write(buf.Bytes())
+}
+
+func (i *Id) Unmarshal(r io.Reader) error {
+	dec := gob.NewDecoder(r)
+	dec.Decode(&i)
 	return nil
 }
 
