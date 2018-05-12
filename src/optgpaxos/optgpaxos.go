@@ -16,6 +16,7 @@ import (
 )
 
 //TODO: Store a sequence of commands per process, instead of a partial order?
+//TODO: Add short commit again
 //TODO: I disabled thrifty optimization and send messages to the quorum size.
 // See broadCast operations and compare with original paxos implementation.
 
@@ -87,7 +88,6 @@ type Instance struct {
 }
 
 type LeaderBookkeeping struct {
-    clientProposals []*genericsmr.Propose
     proposalsById       map[state.Id][]*genericsmr.Propose
     prepareOKs      int
     fastAcceptOKs       map[state.Id]int
@@ -96,15 +96,11 @@ type LeaderBookkeeping struct {
     nacks           int
 }
 
-//func NewReplicaStub(id int, peerAddrList []string, Isleader bool, thrifty bool, exec bool, lread bool, dreply bool, durable bool, prepareChan chan fastrpc.Serializable) *Replica {
-//}
-
 func NewReplica(id int, peerAddrList []string, Isleader bool, thrifty bool, exec bool, lread bool, dreply bool, durable bool) *Replica {
     r := &Replica{genericsmr.NewReplica(id, peerAddrList, thrifty, exec, lread, dreply),
         make(chan fastrpc.Serializable, genericsmr.CHAN_BUFFER_SIZE),
         make(chan fastrpc.Serializable, genericsmr.CHAN_BUFFER_SIZE),
         make(chan fastrpc.Serializable, genericsmr.CHAN_BUFFER_SIZE),
-        //make(chan fastrpc.Serializable, genericsmr.CHAN_BUFFER_SIZE),
         make(chan fastrpc.Serializable, genericsmr.CHAN_BUFFER_SIZE),
         make(chan fastrpc.Serializable, genericsmr.CHAN_BUFFER_SIZE),
         make(chan fastrpc.Serializable, genericsmr.CHAN_BUFFER_SIZE),
@@ -132,7 +128,6 @@ func NewReplica(id int, peerAddrList []string, Isleader bool, thrifty bool, exec
     r.fastAcceptRPC = r.RegisterRPC(new(optgpaxosproto.FastAccept), r.fastAcceptChan)
     r.commitRPC = r.RegisterRPC(new(optgpaxosproto.Commit), r.commitChan)
     r.fullCommitRPC = r.RegisterRPC(new(optgpaxosproto.FullCommit), r.fullCommitChan)
-    //r.commitShortRPC = r.RegisterRPC(new(optgpaxosproto.CommitShort), r.commitShortChan)
     r.prepareReplyRPC = r.RegisterRPC(new(optgpaxosproto.PrepareReply), r.prepareReplyChan)
     r.acceptReplyRPC = r.RegisterRPC(new(optgpaxosproto.AcceptReply), r.acceptReplyChan)
     r.fastAcceptReplyRPC = r.RegisterRPC(new(optgpaxosproto.FastAcceptReply), r.fastAcceptReplyChan)
@@ -285,13 +280,6 @@ func (r *Replica) run() {
             r.handleFullCommit(fullCommit)
             break
 
-        //case commitS := <-r.commitShortChan:
-        //    commit := commitS.(*optgpaxosproto.CommitShort)
-        //    //got a Commit message
-        //    dlog.Printf("Received Commit from replica %d, for instance %d\n", commit.LeaderId, commit.Instance)
-        //    r.handleCommitShort(commit)
-        //    break
-
         case prepareReplyS := <-r.prepareReplyChan:
             prepareReply := prepareReplyS.(*optgpaxosproto.PrepareReply)
             //got a Prepare reply
@@ -396,15 +384,6 @@ func isConflicting(cmd state.Command, otherCmds []state.Command) bool {
     return false
 }
 
-func (r *Replica) nextId() state.Id {
-    cmdId := state.Id(time.Now().UnixNano());
-    for r.lastId == cmdId {
-        cmdId = state.Id(time.Now().UnixNano())
-    }
-    r.lastId = cmdId
-    return r.lastId
-}
-
 func (r *Replica) getFullCommands(instance int32) *state.FullCmds {
     inst := r.instanceSpace[instance]
     fullCmds := &state.FullCmds{
@@ -424,6 +403,32 @@ func (r *Replica) getSeparateCommands(fullCmds *state.FullCmds) (map[state.Id][]
     C := make(map[state.Id][]state.Command)
     D := make(map[state.Id][]state.Id)
     return C, D
+}
+
+func newInstance(createLb bool) *Instance{
+    var lb *LeaderBookkeeping
+
+    if(createLb){
+        lb = &LeaderBookkeeping{
+            make(map[state.Id][]*genericsmr.Propose),
+            0,
+            make(map[state.Id]int),
+            make(map[state.Id]int),
+            0,
+            0,
+        }
+    }
+
+    inst := &Instance{
+        make(map[state.Id][]state.Command),
+        make(map[state.Id][]state.Id),
+        -1,
+        make(map[state.Id]Phase),
+        -1,
+        lb,
+
+    }
+    return inst
 }
 
 func (r *Replica) bcast(quorum int, channel uint8, msg fastrpc.Serializable) {
@@ -559,32 +564,12 @@ func (r *Replica) handlePropose(propose *genericsmr.Propose) {
 
     if r.defaultBallot != ballot || r.forceNewBallot {
         if r.instanceSpace[instNo] == nil {
-
-            lb := &LeaderBookkeeping{
-                proposals,
-                make(map[state.Id][]*genericsmr.Propose),
-                0,
-                make(map[state.Id]int),
-                make(map[state.Id]int),
-                0,
-                0,
-            }
-
-            lb.proposalsById[cmdId] = proposals
-
-            inst := &Instance{
-                make(map[state.Id][]state.Command),
-                make(map[state.Id][]state.Id),
-                ballot,
-                make(map[state.Id]Phase),
-                PREPARING,
-                lb,
-                //nil,
-            }
-
+            inst := newInstance(true)
             inst.cmds[cmdId] = cmds
+            inst.ballot = ballot
+            inst.status = PREPARING
             inst.phase[cmdId] = START
-            //inst.orderedIds = append(inst.orderedIds, cmdId)
+            inst.lb.proposalsById[cmdId] = proposals
             r.instanceSpace[instNo] = inst
         }
         r.forceNewBallot = false
@@ -599,38 +584,17 @@ func (r *Replica) handlePropose(propose *genericsmr.Propose) {
 
         inst := r.instanceSpace[instNo]
         if inst == nil {
-
-            lb := &LeaderBookkeeping{
-                proposals,
-                make(map[state.Id][]*genericsmr.Propose),
-                0,
-                make(map[state.Id]int),
-                make(map[state.Id]int),
-                0,
-                0,
-            }
-
-            lb.proposalsById[cmdId] = proposals
-
-            inst = &Instance{
-                make(map[state.Id][]state.Command),
-                make(map[state.Id][]state.Id),
-                ballot,
-                make(map[state.Id]Phase),
-                FAST_ACCEPT,
-                lb,
-                //nil,
-            }
-
+            inst = newInstance(true)
             r.instanceSpace[instNo] = inst
         }
-
-        inst.lb.proposalsById[cmdId] = proposals
         inst.cmds[cmdId] = cmds
         inst.deps[cmdId] = deps
+        inst.ballot = ballot
+        inst.status = FAST_ACCEPT
         inst.phase[cmdId] = ACCEPTED
         inst.lb.fastAcceptOKs[cmdId] = 1
         inst.lb.fastAcceptNOKs[cmdId] = 0
+        inst.lb.proposalsById[cmdId] = proposals
         dlog.Printf("Created fastAcceptOKs for %d, at instance %d", cmdId, instNo)
 
         r.recordInstanceMetadata(r.instanceSpace[instNo])
@@ -687,19 +651,12 @@ func (r *Replica) handleFastAccept(fastAccept *optgpaxosproto.FastAccept) {
             dlog.Printf("Lower than default! %d < %d", fastAccept.Ballot, r.defaultBallot)
             areply = &optgpaxosproto.FastAcceptReply{fastAccept.Instance, FALSE, r.defaultBallot, -1, nil}
         } else {
-            inst = &Instance{
-                make(map[state.Id][]state.Command),
-                make(map[state.Id][]state.Id),
-                fastAccept.Ballot,
-                make(map[state.Id]Phase),
-                FAST_ACCEPT,
-                nil,
-                //nil,
-            }
+            inst = newInstance(false)
             inst.cmds[fastAccept.Id] = fastAccept.Command
             inst.deps[fastAccept.Id] = deps
+            inst.ballot = fastAccept.Ballot
+            inst.status = FAST_ACCEPT
             inst.phase[fastAccept.Id] = ACCEPTED
-            //inst.orderedIds = append(inst.orderedIds, fastAccept.Id)
             r.instanceSpace[fastAccept.Instance] = inst
 
             areply = &optgpaxosproto.FastAcceptReply{fastAccept.Instance, TRUE, r.defaultBallot, fastAccept.Id, deps}
@@ -744,15 +701,12 @@ func (r *Replica) handleAccept(accept *optgpaxosproto.Accept) {
             dlog.Printf("Lower than default! %d < %d", accept.Ballot, r.defaultBallot)
             areply = &optgpaxosproto.AcceptReply{accept.Instance, FALSE, r.defaultBallot}
         } else {
-            r.instanceSpace[accept.Instance] = &Instance{
-                C,
-                D,
-                accept.Ballot,
-                nil,
-                SLOW_ACCEPT,
-                nil,
-                //S,
-            }
+            inst = newInstance(false)
+            inst.cmds = C
+            inst.deps = D
+            inst.ballot = accept.Ballot
+            inst.status = SLOW_ACCEPT
+            r.instanceSpace[accept.Instance] = inst
             areply = &optgpaxosproto.AcceptReply{accept.Instance, TRUE, r.defaultBallot}
 
         }
@@ -765,10 +719,6 @@ func (r *Replica) handleAccept(accept *optgpaxosproto.Accept) {
         inst.ballot = accept.Ballot
         inst.status = SLOW_ACCEPT
         areply = &optgpaxosproto.AcceptReply{accept.Instance, TRUE, inst.ballot}
-        if inst.lb != nil && inst.lb.clientProposals != nil {
-            //Removed inject commands here
-            dlog.Printf("What to do here - 1?")
-        }
     } else {
         // reordered ACCEPT
         r.instanceSpace[accept.Instance].cmds = C
@@ -796,31 +746,22 @@ func (r *Replica) handleCommit(commit *optgpaxosproto.Commit) {
     dlog.Printf("Handle commit for instance %d.", commit.Instance)
 
     if inst == nil {
-        inst = &Instance{
-            make(map[state.Id][]state.Command),
-            make(map[state.Id][]state.Id),
-            commit.Ballot,
-            make(map[state.Id]Phase),
-            FAST_ACCEPT,
-            nil,
-            //nil,
-        }
+        inst = newInstance(false)
         inst.cmds[commit.Id] = commit.Command
         inst.deps[commit.Id] = commit.Deps
+        inst.ballot = commit.Ballot
+        inst.status = FAST_ACCEPT
         inst.phase[commit.Id] = COMMITTED
-        //inst.orderedIds = append(inst.orderedIds, commit.Id)
         r.instanceSpace[commit.Instance] = inst
-
     } else {
         if(inst.status != FAST_ACCEPT){
             dlog.Printf("Instance moved to slow round.")
         }
         inst.cmds[commit.Id] = commit.Command
         inst.deps[commit.Id] = commit.Deps
-        inst.phase[commit.Id] = COMMITTED
         inst.ballot = commit.Ballot
+        inst.phase[commit.Id] = COMMITTED
         //Removed inject commands here
-        //dlog.Printf("What to do here - 2?")
     }
 
     r.updateCommittedUpTo()
@@ -837,14 +778,13 @@ func (r *Replica) handleFullCommit(fullCommit *optgpaxosproto.FullCommit) {
     C,D:= r.getSeparateCommands(&fullCommit.Cmds)
 
     if inst == nil {
-        r.instanceSpace[fullCommit.Instance] = &Instance{
-            C,
-            D,
-            fullCommit.Ballot,
-            nil,
-            FINISHED,
-            nil,
-        }
+        inst = newInstance(false)
+        inst.cmds = C
+        inst.deps = D
+        inst.ballot = fullCommit.Ballot
+        inst.status = FINISHED
+        r.instanceSpace[fullCommit.Instance] = inst
+
     } else {
         r.instanceSpace[fullCommit.Instance].cmds = C
         r.instanceSpace[fullCommit.Instance].deps = D
@@ -862,10 +802,7 @@ func (r *Replica) handleFullCommit(fullCommit *optgpaxosproto.FullCommit) {
     }
 }
 
-//TODO: Add short commit again
-//func (r *Replica) handleCommitShort(commit *optgpaxosproto.CommitShort) {
-//
-//}
+
 
 //TODO: How to start a fast ballot?
 func (r *Replica) handlePrepareReply(preply *optgpaxosproto.PrepareReply) {
@@ -945,7 +882,7 @@ func (r *Replica) handleFastAcceptReply(areply *optgpaxosproto.FastAcceptReply) 
             inst.phase[areply.Id] = COMMITTED
             r.bcastCommit(areply.Instance, inst.ballot, areply.Id, inst.cmds[areply.Id], inst.deps[areply.Id])
             //TODO: See executeCommands
-            if inst.lb.clientProposals != nil && !r.Dreply {
+            if inst.lb.proposalsById[areply.Id] != nil && !r.Dreply {
                 // give client the all clear
                 for i := 0; i < len(inst.cmds[areply.Id]); i++ {
                     propreply := &genericsmrproto.ProposeReplyTS{
@@ -990,7 +927,7 @@ func (r *Replica) handleAcceptReply(areply *optgpaxosproto.AcceptReply) {
             inst.status = FINISHED
             r.bcastFullCommit(areply.Instance, inst.ballot, inst.cmds, inst.deps/*, inst.orderedIds*/)
             //TODO: See executeCommands
-            if inst.lb.clientProposals != nil && !r.Dreply {
+            if len(inst.lb.proposalsById) > 0 && !r.Dreply {
                 // give client the all clear
                 for id, _ := range inst.cmds{
                     for i := 0; i < len(inst.lb.proposalsById[id]); i++ {
