@@ -96,6 +96,9 @@ type LeaderBookkeeping struct {
     nacks           int
 }
 
+//func NewReplicaStub(id int, peerAddrList []string, Isleader bool, thrifty bool, exec bool, lread bool, dreply bool, durable bool, prepareChan chan fastrpc.Serializable) *Replica {
+//}
+
 func NewReplica(id int, peerAddrList []string, Isleader bool, thrifty bool, exec bool, lread bool, dreply bool, durable bool) *Replica {
     r := &Replica{genericsmr.NewReplica(id, peerAddrList, thrifty, exec, lread, dreply),
         make(chan fastrpc.Serializable, genericsmr.CHAN_BUFFER_SIZE),
@@ -242,7 +245,7 @@ func (r *Replica) run() {
 
         case propose := <-onOffProposeChan:
             //got a Propose from a client
-            dlog.Printf("Received proposal with type=%d\n", propose.Command.Op)
+            dlog.Printf("%d: Received proposal with type=%d\n", r.Id, propose.Command.Op)
             r.handlePropose(propose)
             //deactivate the new proposals channel to prioritize the handling of protocol messages
             onOffProposeChan = nil
@@ -251,34 +254,34 @@ func (r *Replica) run() {
         case prepareS := <-r.prepareChan:
             prepare := prepareS.(*optgpaxosproto.Prepare)
             //got a Prepare message
-            dlog.Printf("Received Prepare from replica %d, for instance %d\n", prepare.LeaderId, prepare.Instance)
+            dlog.Printf("%d: Received Prepare from replica %d, for instance %d\n", r.Id, prepare.LeaderId, prepare.Instance)
             r.handlePrepare(prepare)
             break
 
         case acceptS := <-r.acceptChan:
             accept := acceptS.(*optgpaxosproto.Accept)
             //got an Accept message
-            dlog.Printf("Received Accept from replica %d, for instance %d\n", accept.LeaderId, accept.Instance)
+            dlog.Printf("%d: Received Accept from replica %d, for instance %d\n", r.Id, accept.LeaderId, accept.Instance)
             r.handleAccept(accept)
             break
 
         case fastAcceptS := <-r.fastAcceptChan:
             fastAccept := fastAcceptS.(*optgpaxosproto.FastAccept)
             //got an Accept message
-            dlog.Printf("Received Fast Accept from replica %d, for instance %d\n", fastAccept.LeaderId, fastAccept.Instance)
+            dlog.Printf("%d: Received Fast Accept from replica %d, for instance %d with id %d\n", r.Id, fastAccept.LeaderId, fastAccept.Instance, fastAccept.Id)
             r.handleFastAccept(fastAccept)
             break
 
         case commitS := <-r.commitChan:
             commit := commitS.(*optgpaxosproto.Commit)
             //got a Commit message
-            dlog.Printf("Received Commit from replica %d, for instance %d with id %d\n", commit.LeaderId, commit.Instance, commit.Id)
+            dlog.Printf("%d: Received Commit from replica %d, for instance %d with id %d\n", r.Id, commit.LeaderId, commit.Instance, commit.Id)
             r.handleCommit(commit)
             break
 
         case fullCommitS := <-r.fullCommitChan:
             fullCommit := fullCommitS.(*optgpaxosproto.FullCommit)
-            dlog.Printf("Received Full Commit from replica %d, for instance %d\n", fullCommit.LeaderId, fullCommit.Instance)
+            dlog.Printf("%d: Received Full Commit from replica %d, for instance %d\n", r.Id, fullCommit.LeaderId, fullCommit.Instance)
             r.handleFullCommit(fullCommit)
             break
 
@@ -292,21 +295,21 @@ func (r *Replica) run() {
         case prepareReplyS := <-r.prepareReplyChan:
             prepareReply := prepareReplyS.(*optgpaxosproto.PrepareReply)
             //got a Prepare reply
-            dlog.Printf("Received PrepareReply for instance %d\n", prepareReply.Instance)
+            dlog.Printf("%d: Received PrepareReply for instance %d\n", r.Id, prepareReply.Instance)
             r.handlePrepareReply(prepareReply)
             break
 
         case acceptReplyS := <-r.acceptReplyChan:
             acceptReply := acceptReplyS.(*optgpaxosproto.AcceptReply)
             //got an Accept reply
-            dlog.Printf("Received AcceptReply for instance %d\n", acceptReply.Instance)
+            dlog.Printf("%d: Received AcceptReply for instance %d\n", r.Id, acceptReply.Instance)
             r.handleAcceptReply(acceptReply)
             break
 
         case fastAcceptReplyS := <-r.fastAcceptReplyChan:
             fastAcceptReply := fastAcceptReplyS.(*optgpaxosproto.FastAcceptReply)
             //got an Accept reply
-            dlog.Printf("Received FastAcceptReply for instance %d\n", fastAcceptReply.Instance)
+            dlog.Printf("%d: Received FastAcceptReply for instance %d\n", r.Id, fastAcceptReply.Instance)
             r.handleFastAcceptReply(fastAcceptReply)
         break
         }
@@ -521,7 +524,7 @@ func (r *Replica) handlePropose(propose *genericsmr.Propose) {
         return
     }
 
-    dlog.Printf("Handle propose at coordinator")
+    dlog.Printf("Handle propose")
 
     for r.instanceSpace[r.crtInstance] != nil && r.instanceSpace[r.crtInstance].status != FAST_ACCEPT {
         r.crtInstance++
@@ -535,9 +538,12 @@ func (r *Replica) handlePropose(propose *genericsmr.Propose) {
         batchSize = MAX_BATCH
     }
 
-    dlog.Printf("Batched %d\n", batchSize)
+    dlog.Printf("Batched %d", batchSize)
 
-    cmdId := r.nextId()
+    //TODO: Check ID of commands with multiple clients.
+    cmdId := state.Id(propose.CommandId)
+    dlog.Printf("ID for command: %d", cmdId)
+
     cmds := make([]state.Command, batchSize)
     proposals := make([]*genericsmr.Propose, batchSize)
     cmds[0] = propose.Command
@@ -605,7 +611,6 @@ func (r *Replica) handlePropose(propose *genericsmr.Propose) {
             }
 
             lb.proposalsById[cmdId] = proposals
-            dlog.Printf("Proposals for %d : %v", cmdId, proposals)
 
             inst = &Instance{
                 make(map[state.Id][]state.Command),
@@ -637,7 +642,7 @@ func (r *Replica) handlePropose(propose *genericsmr.Propose) {
 }
 
 func (r *Replica) handlePrepare(prepare *optgpaxosproto.Prepare) {
-    dlog.Printf("Reply to 1A message with 1B message.")
+    dlog.Printf("Reply to 1A message with 1B message for instance %d with ballot", prepare.Instance, prepare.Ballot)
     inst := r.instanceSpace[prepare.Instance]
     var preply *optgpaxosproto.PrepareReply
 
@@ -665,13 +670,12 @@ func (r *Replica) handlePrepare(prepare *optgpaxosproto.Prepare) {
 }
 
 func (r *Replica) handleFastAccept(fastAccept *optgpaxosproto.FastAccept) {
-    dlog.Printf("Respond 2A Fast message with 2B Fast message")
-
-    var areply *optgpaxosproto.FastAcceptReply
-
+    dlog.Printf("Respond 2A Fast message with 2B Fast message for instance %d with id %d", fastAccept.Instance, fastAccept.Id)
     inst := r.instanceSpace[fastAccept.Instance]
 
+    var areply *optgpaxosproto.FastAcceptReply
     var deps []state.Id
+
     for _, cmd := range fastAccept.Command {
         deps = append(deps, r.getDeps(cmd, fastAccept.Instance)...)
     }
@@ -730,7 +734,7 @@ func (r *Replica) handleFastAccept(fastAccept *optgpaxosproto.FastAccept) {
 }
 
 func (r *Replica) handleAccept(accept *optgpaxosproto.Accept) {
-    dlog.Printf("Respond 2A message with 2B message")
+    dlog.Printf("Respond 2A message with 2B message for instance %d with ballot", accept.Instance, accept.Ballot)
     inst := r.instanceSpace[accept.Instance]
     C,D := r.getSeparateCommands(&accept.Cmds)
     var areply *optgpaxosproto.AcceptReply
@@ -788,8 +792,8 @@ func (r *Replica) handleAccept(accept *optgpaxosproto.Accept) {
 }
 
 func (r *Replica) handleCommit(commit *optgpaxosproto.Commit) {
-    dlog.Printf("Handle commit")
     inst := r.instanceSpace[commit.Instance]
+    dlog.Printf("Handle commit for instance %d.", commit.Instance)
 
     if inst == nil {
         inst = &Instance{
@@ -816,7 +820,7 @@ func (r *Replica) handleCommit(commit *optgpaxosproto.Commit) {
         inst.phase[commit.Id] = COMMITTED
         inst.ballot = commit.Ballot
         //Removed inject commands here
-        dlog.Printf("What to do here - 2?")
+        //dlog.Printf("What to do here - 2?")
     }
 
     r.updateCommittedUpTo()
@@ -828,8 +832,7 @@ func (r *Replica) handleCommit(commit *optgpaxosproto.Commit) {
 
 func (r *Replica) handleFullCommit(fullCommit *optgpaxosproto.FullCommit) {
     inst := r.instanceSpace[fullCommit.Instance]
-
-    dlog.Printf("Full Committing instance %d\n", fullCommit.Instance)
+    dlog.Printf("Handle full commit for instance %d with ballot %d", fullCommit.Instance, fullCommit.Ballot)
 
     C,D:= r.getSeparateCommands(&fullCommit.Cmds)
 
@@ -848,7 +851,6 @@ func (r *Replica) handleFullCommit(fullCommit *optgpaxosproto.FullCommit) {
         r.instanceSpace[fullCommit.Instance].ballot = fullCommit.Ballot
         r.instanceSpace[fullCommit.Instance].status = FINISHED
         //Removed inject commands here
-        dlog.Printf("What to do here - 3?")
     }
 
     r.updateCommittedUpTo()
@@ -1031,9 +1033,6 @@ func (r *Replica) executeCommands() {
                 for id, _ := range inst.cmds {
                     if inst.phase[id] != DELIVERED && r.checkDependenciesDelived(id, i){
                         dlog.Printf("Trying to execute instance: %d, id: %d, status: %v, phase %v", i, id, inst.status, inst.phase[id])
-                        if(inst.lb != nil){
-                            dlog.Printf("id %d, Commands %v\nProposal %+v", id, inst.cmds[id], inst.lb.proposalsById[id])
-                        }
                         for j, cmd := range inst.cmds[id] {
                             if r.Dreply && inst.lb != nil && inst.lb.proposalsById != nil {
                                 val := cmd.Execute(r.State)
