@@ -13,6 +13,8 @@ import (
     "time"
     "math"
     "fmt"
+    "bufio"
+    "chansmr"
 )
 
 //TODO: Store a sequence of commands per process, instead of a partial order?
@@ -94,6 +96,67 @@ type LeaderBookkeeping struct {
     fastAcceptNOKs       map[state.Id]int
     acceptOKs       int
     nacks           int
+}
+
+
+type channels struct {
+    proposeChan         chan *genericsmr.Propose
+    prepareChan         chan fastrpc.Serializable
+    acceptChan          chan fastrpc.Serializable
+    fastAcceptChan      chan fastrpc.Serializable
+    commitChan          chan fastrpc.Serializable
+    //commitShortChan     chan fastrpc.Serializable
+    fullCommitChan      chan fastrpc.Serializable
+    prepareReplyChan    chan fastrpc.Serializable
+    acceptReplyChan     chan fastrpc.Serializable
+    fastAcceptReplyChan chan fastrpc.Serializable
+}
+
+type connection struct{
+    is	*chansmr.ChanReader
+    os  *chansmr.ChanWriter
+}
+
+func NewReplicaStub(id int, peerAddrList []string, Isleader bool, thrifty bool, exec bool, lread bool, dreply bool, durable bool, chans *channels, connections map[int32]*connection) *Replica {
+    r := &Replica{genericsmr.NewReplica(id, peerAddrList, thrifty, exec, lread, dreply),
+        chans.prepareChan,
+        chans.acceptChan,
+        chans.fastAcceptChan,
+        chans.commitChan,
+        chans.fullCommitChan,
+        chans.prepareReplyChan,
+        chans.acceptReplyChan,
+        chans.fastAcceptReplyChan,
+        0, 0, 0, 0, 0, 0, 0, 0, 0,
+        false,
+        make([]*Instance, 15*1024*1024),
+        0,
+        -1,
+        -1,
+        false,
+        0,
+        true,
+        -1,
+        false,
+        -1,
+    }
+
+    r.Durable = durable
+    r.IsLeader = Isleader
+    r.ProposeChan = chans.proposeChan
+
+    r.prepareRPC = r.RegisterRPC(new(optgpaxosproto.Prepare), r.prepareChan)
+    r.acceptRPC = r.RegisterRPC(new(optgpaxosproto.Accept), r.acceptChan)
+    r.fastAcceptRPC = r.RegisterRPC(new(optgpaxosproto.FastAccept), r.fastAcceptChan)
+    r.commitRPC = r.RegisterRPC(new(optgpaxosproto.Commit), r.commitChan)
+    r.fullCommitRPC = r.RegisterRPC(new(optgpaxosproto.FullCommit), r.fullCommitChan)
+    r.prepareReplyRPC = r.RegisterRPC(new(optgpaxosproto.PrepareReply), r.prepareReplyChan)
+    r.acceptReplyRPC = r.RegisterRPC(new(optgpaxosproto.AcceptReply), r.acceptReplyChan)
+    r.fastAcceptReplyRPC = r.RegisterRPC(new(optgpaxosproto.FastAcceptReply), r.fastAcceptReplyChan)
+
+    go r.runFake(connections)
+
+    return r
 }
 
 func NewReplica(id int, peerAddrList []string, Isleader bool, thrifty bool, exec bool, lread bool, dreply bool, durable bool) *Replica {
@@ -225,12 +288,38 @@ func (r *Replica) run() {
 
     clockChan = make(chan bool, 1)
     go r.clock()
-    onOffProposeChan := r.ProposeChan
 
     go r.WaitForClientConnections()
 
-    for !r.Shutdown {
+    r.messageLoop()
+}
 
+func (r *Replica) runFake(connections map[int32]*connection) {
+
+    for i := 0; i < len(connections); i++ {
+        r.Alive[i] = true
+        r.PeerReaders[i] = bufio.NewReader(connections[int32(i)].is)
+        r.PeerWriters[i] = bufio.NewWriter(connections[int32(i)].os)
+        log.Printf("OUT Connected to %d", i)
+    }
+    log.Printf("Replica id: %d. Done connecting to peers\n", r.Id)
+
+    if r.IsLeader {
+        log.Println("I am the leader")
+    }
+
+    //if r.Exec {
+    //    go r.executeCommands()
+    //}
+
+    clockChan = make(chan bool, 1)
+    go r.clock()
+    r.messageLoop()
+}
+
+func (r *Replica) messageLoop() {
+    onOffProposeChan := r.ProposeChan
+    for !r.Shutdown {
         select {
 
         case <-clockChan:
@@ -299,7 +388,7 @@ func (r *Replica) run() {
             //got an Accept reply
             dlog.Printf("%d: Received FastAcceptReply for instance %d\n", r.Id, fastAcceptReply.Instance)
             r.handleFastAcceptReply(fastAcceptReply)
-        break
+            break
         }
 
     }

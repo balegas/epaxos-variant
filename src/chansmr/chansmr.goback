@@ -1,0 +1,277 @@
+package chansmr
+
+import (
+	"bufio"
+	"fastrpc"
+	"fmt"
+	"genericsmrproto"
+	"log"
+	"net"
+	"os"
+	"state"
+	"time"
+	"sync"
+	"dlog"
+)
+
+const CHAN_BUFFER_SIZE = 200000
+const TRUE = uint8(1)
+const FALSE = uint8(0)
+
+type RPCPair struct {
+	Obj  fastrpc.Serializable
+	Chan chan fastrpc.Serializable
+}
+
+type Propose struct {
+	*genericsmrproto.Propose
+	Reply *bufio.Writer
+	Mutex *sync.Mutex
+}
+
+type Beacon struct {
+	Rid       int32
+	Timestamp int64
+}
+
+type connection struct{
+	is	*ChanReader
+	os  *ChanWriter
+}
+
+type Replica struct {
+	N            int        // total number of replicas
+	Id           int32      // the ID of the current replica
+	PeerAddrList []string   // array with the IP:port address of every replica
+	Peers        []net.Conn // cache of connections to all other replicas
+	PeerReaders  []*bufio.Reader
+	PeerWriters  []*bufio.Writer
+	Alive        []bool // connection status
+	Listener     net.Listener
+
+	State *state.State
+
+	ProposeChan chan *Propose // channel for client proposals
+	BeaconChan  chan *Beacon  // channel for beacons from peer replicas
+
+	Shutdown bool
+
+	Thrifty bool // send only as many messages as strictly required?
+	Exec    bool // execute commands?
+	LRead   bool // execute local reads?
+	Dreply  bool // reply to client after command has been executed?
+	Beacon  bool // send beacons to detect how fast are the other replicas?
+
+	Durable     bool     // log to a stable store?
+	StableStore *os.File // file support for the persistent log
+
+	PreferredPeerOrder []int32 // replicas in the preferred order of communication
+
+	rpcTable map[uint8]*RPCPair
+	rpcCode  uint8
+
+	Ewma []float64
+	Latencies []int64
+
+	Mutex sync.Mutex
+
+	Stats *genericsmrproto.Stats
+
+    connections map[int32]connection
+}
+
+
+func NewReplica(id int, peerAddrList []string , thrifty bool, exec bool, lread bool, dreply bool, connections map[int32]connection) *Replica {
+	r := &Replica{
+		len(peerAddrList),
+		int32(id),
+		peerAddrList,
+		make([]net.Conn, len(peerAddrList)),
+		make([]*bufio.Reader, len(peerAddrList)),
+		make([]*bufio.Writer, len(peerAddrList)),
+		make([]bool, len(peerAddrList)),
+		nil,
+		state.InitState(),
+		make(chan *Propose, CHAN_BUFFER_SIZE),
+		make(chan *Beacon, CHAN_BUFFER_SIZE),
+		false,
+		thrifty,
+		exec,
+		lread,
+		dreply,
+		false,
+		false,
+		nil,
+		make([]int32, len(peerAddrList)),
+		make(map[uint8]*RPCPair),
+		genericsmrproto.GENERIC_SMR_BEACON_REPLY + 1,
+		make([]float64, len(peerAddrList)),
+		make([]int64, len(peerAddrList)),
+		sync.Mutex{},
+		&genericsmrproto.Stats{make(map[string]int)},
+		connections,
+	}
+
+	var err error
+
+	if r.StableStore, err = os.Create(fmt.Sprintf("stable-store-replica%d", r.Id)); err != nil {
+		log.Fatal(err)
+	}
+
+	for i := 0; i < r.N; i++ {
+		r.PreferredPeerOrder[i] = int32((int(r.Id) + 1 + i) % r.N)
+		r.Ewma[i] = 0.0
+		r.Latencies[i] = 0
+	}
+
+	return r
+}
+
+/* Client API */
+
+func (r *Replica) Ping(args *genericsmrproto.PingArgs, reply *genericsmrproto.PingReply) error {
+	return nil
+}
+
+func (r *Replica) BeTheLeader(args *genericsmrproto.BeTheLeaderArgs, reply *genericsmrproto.BeTheLeaderReply) error {
+	return nil
+}
+
+/* ============= */
+
+func (r *Replica) ConnectToPeers(connections map[int32]connection ) {
+	//connect to peers
+	for i := 0; i < len(connections); i++ {
+		r.Alive[i] = true
+		r.PeerReaders[i] = bufio.NewReader(connections[int32(i)].is)
+		r.PeerWriters[i] = bufio.NewWriter(connections[int32(i)].os)
+		log.Printf("OUT Connected to %d", i)
+	}
+	log.Printf("Replica id: %d. Done connecting to peers\n", r.Id)
+
+	for rid, reader := range r.PeerReaders {
+		if int32(rid) == r.Id {
+			continue
+		}
+		go r.replicaListener(rid, reader)
+	}
+
+}
+
+
+func (r *Replica) replicaListener(rid int, reader *bufio.Reader) {
+	var msgType uint8
+	var err error = nil
+	var gbeacon genericsmrproto.Beacon
+	var gbeaconReply genericsmrproto.BeaconReply
+
+	for err == nil && !r.Shutdown {
+
+		if msgType, err = reader.ReadByte(); err != nil {
+			break
+		}
+
+		switch uint8(msgType) {
+
+		case genericsmrproto.GENERIC_SMR_BEACON:
+			if err = gbeacon.Unmarshal(reader); err != nil {
+				break
+			}
+			beacon := &Beacon{int32(rid), gbeacon.Timestamp}
+			r.ReplyBeacon(beacon)
+			break
+
+		case genericsmrproto.GENERIC_SMR_BEACON_REPLY:
+			if err = gbeaconReply.Unmarshal(reader); err != nil {
+				break
+			}
+			//dlog.Println("receive beacon ", gbeaconReply.Timestamp, " reply from ",rid)
+			//TODO: UPDATE STUFF
+			r.Mutex.Lock()
+			r.Latencies[rid] += time.Now().UnixNano() - gbeaconReply.Timestamp
+			r.Mutex.Unlock()
+			r.Ewma[rid] = 0.99*r.Ewma[rid] + 0.01*float64(time.Now().UnixNano()-gbeaconReply.Timestamp)
+			break
+
+		default:
+			if rpair, present := r.rpcTable[msgType]; present {
+				obj := rpair.Obj.New()
+				if err = obj.Unmarshal(reader); err != nil {
+					break
+				}
+				rpair.Chan <- obj
+			} else {
+				log.Fatal("Error: received unknown message type ", msgType," from  ", rid)
+			}
+		}
+	}
+
+	r.Alive[rid] = false
+}
+
+func (r *Replica) RegisterRPC(msgObj fastrpc.Serializable, notify chan fastrpc.Serializable) uint8 {
+	code := r.rpcCode
+	r.rpcCode++
+	r.rpcTable[code] = &RPCPair{msgObj, notify}
+	dlog.Println("registering RPC ",r.rpcCode)
+	return code
+}
+
+func (r *Replica) SendMsg(peerId int32, code uint8, msg fastrpc.Serializable) {
+	w := r.PeerWriters[peerId]
+	if w==nil{
+		log.Printf("Connection to %d lost!\n", peerId)
+		return
+	}
+	w.WriteByte(code)
+	msg.Marshal(w)
+	w.Flush()
+}
+
+func (r *Replica) SendMsgNoFlush(peerId int32, code uint8, msg fastrpc.Serializable) {
+	w := r.PeerWriters[peerId]
+	if w==nil{
+		log.Printf("Connection to %d lost!\n", peerId)
+		return
+	}
+	w.WriteByte(code)
+	msg.Marshal(w)
+}
+
+func (r *Replica) ReplyProposeTS(reply *genericsmrproto.ProposeReplyTS, w *bufio.Writer, lock *sync.Mutex) {
+	r.Mutex.Lock()
+	defer r.Mutex.Unlock()
+	reply.Marshal(w)
+	w.Flush()
+}
+
+func (r *Replica) SendBeacon(peerId int32) {
+	r.Mutex.Lock()
+	w := r.PeerWriters[peerId]
+	if w==nil{
+		log.Printf("Connection to %d lost!\n", peerId)
+		return
+	}
+	w.WriteByte(genericsmrproto.GENERIC_SMR_BEACON)
+	beacon := &genericsmrproto.Beacon{Timestamp: time.Now().UnixNano()}
+	beacon.Marshal(w)
+	w.Flush()
+	//dlog.Println("send beacon ", beacon.Timestamp, " to ", peerId)
+	r.Mutex.Unlock()
+}
+
+func (r *Replica) ReplyBeacon(beacon *Beacon) {
+	//dlog.Println("replying beacon to ",beacon.Rid)
+	r.Mutex.Lock()
+	w := r.PeerWriters[beacon.Rid]
+	if w==nil{
+		log.Printf("Connection to %d lost!\n", beacon.Rid)
+		return
+	}
+	w.WriteByte(genericsmrproto.GENERIC_SMR_BEACON_REPLY)
+	rb := &genericsmrproto.BeaconReply{beacon.Timestamp}
+	rb.Marshal(w)
+	w.Flush()
+	r.Mutex.Unlock()
+}
+
