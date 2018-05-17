@@ -21,10 +21,8 @@ type RepChan struct{
 }
 
 //Assumes buffer is large enought to get messages.
-const BUFFER_SIZE = 4096
+const BufferSize = 4096
 var connections map[int32]*connection
-var codeBuf = make([]byte, 1)
-var payloadBuf = make([]byte, BUFFER_SIZE)
 var reps []*RepChan
 var leaderIOChan *bufio.ReadWriter
 var mutex *sync.Mutex
@@ -37,22 +35,22 @@ func initReplicas(count int) []*RepChan{
     connections = make(map[int32]*connection)
 
     for i := 0 ; i < count; i++ {
-        ic := make(chan byte, BUFFER_SIZE)
+        ic := make(chan byte, BufferSize)
         oc := ic
         connections[int32(i)] = &connection{chansmr.NewChanReader(ic), chansmr.NewChanWriter(oc)}
     }
 
     for i := 0 ; i < count; i++ {
         repiChan := &channels{
-            make(chan *genericsmr.Propose, BUFFER_SIZE),
-            make(chan fastrpc.Serializable, BUFFER_SIZE),
-            make(chan fastrpc.Serializable, BUFFER_SIZE),
-            make(chan fastrpc.Serializable, BUFFER_SIZE),
-            make(chan fastrpc.Serializable, BUFFER_SIZE),
-            make(chan fastrpc.Serializable, BUFFER_SIZE),
-            make(chan fastrpc.Serializable, BUFFER_SIZE),
-            make(chan fastrpc.Serializable, BUFFER_SIZE),
-            make(chan fastrpc.Serializable, BUFFER_SIZE),
+            make(chan *genericsmr.Propose, BufferSize),
+            make(chan fastrpc.Serializable, BufferSize),
+            make(chan fastrpc.Serializable, BufferSize),
+            make(chan fastrpc.Serializable, BufferSize),
+            make(chan fastrpc.Serializable, BufferSize),
+            make(chan fastrpc.Serializable, BufferSize),
+            make(chan fastrpc.Serializable, BufferSize),
+            make(chan fastrpc.Serializable, BufferSize),
+            make(chan fastrpc.Serializable, BufferSize),
         }
 
         ret[i] = &RepChan{
@@ -65,58 +63,121 @@ func initReplicas(count int) []*RepChan{
     return ret
 }
 
-func setup(){
-    reps = initReplicas(3)
-    proposeChanR := bufio.NewReader(chansmr.NewChanReader(make(chan byte, BUFFER_SIZE)))
-    proposeChanW := bufio.NewWriter(chansmr.NewChanWriter(make(chan byte, BUFFER_SIZE)))
+func setup(replicaCount int){
+    reps = initReplicas(replicaCount)
+    leaderChan := make(chan byte, BufferSize)
+    proposeChanR := bufio.NewReader(chansmr.NewChanReader(leaderChan))
+    proposeChanW := bufio.NewWriter(chansmr.NewChanWriter(leaderChan))
     leaderIOChan = bufio.NewReadWriter(proposeChanR, proposeChanW)
     mutex = &sync.Mutex{}
 }
 
-func TestClassicRound(t *testing.T) {
-    setup()
-    leaderChan := make(chan byte, BUFFER_SIZE)
-    proposeChanR := bufio.NewReader(chansmr.NewChanReader(leaderChan))
-    proposeChanW := bufio.NewWriter(chansmr.NewChanWriter(leaderChan))
-    leaderIO := bufio.NewReadWriter(proposeChanR, proposeChanW)
-    mutex := &sync.Mutex{}
+//func TestClassicRound(t *testing.T) {
+//    setup(3)
+//    reps[0].C.proposeChan <- &genericsmr.Propose{createProposal(state.PUT, 0), leaderIOChan.Writer, mutex}
+//    <- control
+//   executeSlowPath()
+//
+//    reply := new(genericsmrproto.ProposeReply)
+//    reply.Unmarshal(leaderIOChan.Reader)
+//    log.Printf("Reply: %v", reply)
+//    if reply.OK != 1 {
+//        t.Errorf("Failed Classic Round.")
+//    }
+//}
 
+func TestFastRound(t *testing.T) {
+    setup(3)
 
-    reps[0].C.proposeChan <- &genericsmr.Propose{createProposal(state.PUT, 0), leaderIO.Writer, mutex}
+    reps[0].C.proposeChan <- &genericsmr.Propose{createProposal(0, state.PUT, 0, 0), leaderIOChan.Writer, mutex}
     <- control
 
-    prepare1 := readMessage(1, new(optgpaxosproto.Prepare))
-    prepare2 := readMessage(2, new(optgpaxosproto.Prepare))
+    executeSlowPath()
 
-    prepareReply1 := processMsgAndGetReply(prepareChan(1), prepare1, true, 0, new(optgpaxosproto.PrepareReply))
-    prepareReply2 := processMsgAndGetReply(prepareChan(2), prepare2, true, 0, new(optgpaxosproto.PrepareReply))
-
-    processMsg(prepareReplyChan(0), prepareReply1, true)
-    processMsg(prepareReplyChan(0), prepareReply2, true)
-
-    accept1 := readMessage(1, new(optgpaxosproto.Accept))
-    accept2 := readMessage(2, new(optgpaxosproto.Accept))
-
-    acceptReply1 := processMsgAndGetReply(acceptChan(1), accept1, true, 0, new(optgpaxosproto.AcceptReply))
-    acceptReply2 := processMsgAndGetReply(acceptChan(2), accept2, true, 0, new(optgpaxosproto.AcceptReply))
-
-    processMsg(acceptReplyChan(0), acceptReply1, true)
-    processMsg(acceptReplyChan(0), acceptReply2, true)
-
-    commit1 := readMessage(1, new(optgpaxosproto.FullCommit))
-    commit2 := readMessage(2, new(optgpaxosproto.FullCommit))
-
-    processMsg(reps[1].C.fullCommitChan, commit1, true)
-    processMsg(reps[2].C.fullCommitChan, commit2, true)
-
-    reply := new(genericsmrproto.ProposeReply)
-    reply.Unmarshal(leaderIO.Reader)
+    reply := new(genericsmrproto.ProposeReplyTS)
+    reply.Unmarshal(leaderIOChan.Reader)
     log.Printf("Reply: %v", reply)
     if reply.OK != 1 {
         t.Errorf("Failed Classic Round.")
     }
 
+    reps[0].C.proposeChan <- &genericsmr.Propose{createProposal(1, state.PUT, 1, 1), leaderIOChan.Writer, mutex}
+    <- control
 
+    executeFastPath()
+
+    reply = new(genericsmrproto.ProposeReplyTS)
+    reply.Unmarshal(leaderIOChan.Reader)
+    log.Printf("Reply: %v", reply)
+    if reply.OK != 1 {
+        t.Errorf("Failed FAST Round.")
+    }
+}
+
+func executeFastPath(){
+    fastAccepts := make([]fastrpc.Serializable, len(reps))
+    for i := 1; i < len(reps); i++{
+        fastAccepts[i] = readMessage(int32(i), new(optgpaxosproto.FastAccept))
+    }
+
+    fastAacceptReplies := make([]fastrpc.Serializable, len(reps))
+    for i := 1; i < len(reps); i++{
+        fastAacceptReplies[i] = processMsgAndGetReply(fastAcceptChan(1), fastAccepts[i], true, 0, new(optgpaxosproto.FastAcceptReply))
+    }
+
+    for i := 1; i < len(reps); i++{
+        processMsg(fastAcceptReplyChan(0), fastAacceptReplies[i], true)
+    }
+
+    commits := make([]fastrpc.Serializable, len(reps))
+    for i := 1; i < len(reps); i++{
+       commits[i] = readMessage(int32(i), new(optgpaxosproto.Commit))
+    }
+
+    for i := 1; i < len(reps); i++{
+       processMsg(commitChan(0), commits[i], true)
+    }
+
+}
+
+func executeSlowPath(){
+
+    prepares := make([]fastrpc.Serializable, len(reps))
+    for i := 1; i < len(reps); i++{
+        prepares[i] = readMessage(int32(i), new(optgpaxosproto.Prepare))
+    }
+
+    prepareReplies := make([]fastrpc.Serializable, len(reps))
+    for i := 1; i < len(reps); i++{
+        prepareReplies[i] = processMsgAndGetReply(prepareChan(int32(i)), prepares[i], true, 0, new(optgpaxosproto.PrepareReply))
+    }
+
+    for i := 1; i < len(reps); i++{
+        processMsg(prepareReplyChan(0), prepareReplies[i], true)
+    }
+
+    accepts := make([]fastrpc.Serializable, len(reps))
+    for i := 1; i < len(reps); i++{
+        accepts[i] = readMessage(int32(i), new(optgpaxosproto.Accept))
+    }
+
+    acceptReplies := make([]fastrpc.Serializable, len(reps))
+    for i := 1; i < len(reps); i++{
+        acceptReplies[i] = processMsgAndGetReply(acceptChan(1), accepts[i], true, 0, new(optgpaxosproto.AcceptReply))
+    }
+
+    for i := 1; i < len(reps); i++{
+        processMsg(acceptReplyChan(0), acceptReplies[i], true)
+    }
+
+    fullCommits := make([]fastrpc.Serializable, len(reps))
+    for i := 1; i < len(reps); i++{
+        fullCommits[i] = readMessage(int32(i), new(optgpaxosproto.FullCommit))
+    }
+
+    for i := 1; i < len(reps); i++{
+        processMsg(fullCommitChan(int32(i)), fullCommits[i], true)
+    }
 
 }
 
@@ -141,10 +202,10 @@ func readMessage(rId int32, msg fastrpc.Serializable ) fastrpc.Serializable {
     return msg
 }
 
-func createProposal(op state.Operation, k state.Key) *genericsmrproto.Propose {
+func createProposal(id int32, op state.Operation, k state.Key, ts int64) *genericsmrproto.Propose {
     value := make([]byte, 4)
     rand.Read(value)
-    return &genericsmrproto.Propose{0,state.Command{op, k, value},0}
+    return &genericsmrproto.Propose{id,state.Command{op, k, value},ts}
 }
 
 func prepareChan(rId int32) chan fastrpc.Serializable {
@@ -163,7 +224,15 @@ func acceptReplyChan(rId int32) chan fastrpc.Serializable {
     return reps[rId].C.acceptReplyChan
 }
 
-func commmitChan(rId int32) chan fastrpc.Serializable {
+func fastAcceptChan(rId int32) chan fastrpc.Serializable {
+    return reps[rId].C.fastAcceptChan
+}
+
+func fastAcceptReplyChan(rId int32) chan fastrpc.Serializable {
+    return reps[rId].C.fastAcceptReplyChan
+}
+
+func commitChan(rId int32) chan fastrpc.Serializable {
     return reps[rId].C.commitChan
 }
 

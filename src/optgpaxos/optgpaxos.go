@@ -404,7 +404,7 @@ func (r *Replica) messageLoop(control chan bool) {
 }
 
 func sendControl(control chan bool){
-    log.Printf("Sent Control")
+    //log.Printf("Sent Control")
     if(control !=  nil){
         control <- true
     }
