@@ -117,7 +117,7 @@ type connection struct{
     os  *chansmr.ChanWriter
 }
 
-func NewReplicaStub(id int, peerAddrList []string, Isleader bool, thrifty bool, exec bool, lread bool, dreply bool, durable bool, chans *channels, connections map[int32]*connection) *Replica {
+func NewReplicaStub(id int, peerAddrList []string, Isleader bool, thrifty bool, exec bool, lread bool, dreply bool, durable bool, chans *channels, connections map[int32]*connection, control chan bool) *Replica {
     r := &Replica{genericsmr.NewReplica(id, peerAddrList, thrifty, exec, lread, dreply),
         chans.prepareChan,
         chans.acceptChan,
@@ -154,7 +154,7 @@ func NewReplicaStub(id int, peerAddrList []string, Isleader bool, thrifty bool, 
     r.acceptReplyRPC = r.RegisterRPC(new(optgpaxosproto.AcceptReply), r.acceptReplyChan)
     r.fastAcceptReplyRPC = r.RegisterRPC(new(optgpaxosproto.FastAcceptReply), r.fastAcceptReplyChan)
 
-    go r.runFake(connections)
+    go r.runFake(connections, control)
 
     return r
 }
@@ -291,10 +291,10 @@ func (r *Replica) run() {
 
     go r.WaitForClientConnections()
 
-    r.messageLoop()
+    r.messageLoop(nil)
 }
 
-func (r *Replica) runFake(connections map[int32]*connection) {
+func (r *Replica) runFake(connections map[int32]*connection, control chan bool) {
 
     for i := 0; i < len(connections); i++ {
         r.Alive[i] = true
@@ -314,10 +314,10 @@ func (r *Replica) runFake(connections map[int32]*connection) {
 
     clockChan = make(chan bool, 1)
     go r.clock()
-    r.messageLoop()
+    r.messageLoop(control)
 }
 
-func (r *Replica) messageLoop() {
+func (r *Replica) messageLoop(control chan bool) {
     onOffProposeChan := r.ProposeChan
     for !r.Shutdown {
         select {
@@ -332,6 +332,7 @@ func (r *Replica) messageLoop() {
             dlog.Printf("%d: Received proposal with type=%d\n", r.Id, propose.Command.Op)
             r.handlePropose(propose)
             //deactivate the new proposals channel to prioritize the handling of protocol messages
+            sendControl(control)
             onOffProposeChan = nil
             break
 
@@ -340,6 +341,7 @@ func (r *Replica) messageLoop() {
             //got a Prepare message
             dlog.Printf("%d: Received Prepare from replica %d, for instance %d\n", r.Id, prepare.LeaderId, prepare.Instance)
             r.handlePrepare(prepare)
+            sendControl(control)
             break
 
         case acceptS := <-r.acceptChan:
@@ -347,6 +349,7 @@ func (r *Replica) messageLoop() {
             //got an Accept message
             dlog.Printf("%d: Received Accept from replica %d, for instance %d\n", r.Id, accept.LeaderId, accept.Instance)
             r.handleAccept(accept)
+            sendControl(control)
             break
 
         case fastAcceptS := <-r.fastAcceptChan:
@@ -354,6 +357,7 @@ func (r *Replica) messageLoop() {
             //got an Accept message
             dlog.Printf("%d: Received Fast Accept from replica %d, for instance %d with id %d\n", r.Id, fastAccept.LeaderId, fastAccept.Instance, fastAccept.Id)
             r.handleFastAccept(fastAccept)
+            sendControl(control)
             break
 
         case commitS := <-r.commitChan:
@@ -361,12 +365,14 @@ func (r *Replica) messageLoop() {
             //got a Commit message
             dlog.Printf("%d: Received Commit from replica %d, for instance %d with id %d\n", r.Id, commit.LeaderId, commit.Instance, commit.Id)
             r.handleCommit(commit)
+            sendControl(control)
             break
 
         case fullCommitS := <-r.fullCommitChan:
             fullCommit := fullCommitS.(*optgpaxosproto.FullCommit)
             dlog.Printf("%d: Received Full Commit from replica %d, for instance %d\n", r.Id, fullCommit.LeaderId, fullCommit.Instance)
             r.handleFullCommit(fullCommit)
+            sendControl(control)
             break
 
         case prepareReplyS := <-r.prepareReplyChan:
@@ -374,6 +380,7 @@ func (r *Replica) messageLoop() {
             //got a Prepare reply
             dlog.Printf("%d: Received PrepareReply for instance %d\n", r.Id, prepareReply.Instance)
             r.handlePrepareReply(prepareReply)
+            sendControl(control)
             break
 
         case acceptReplyS := <-r.acceptReplyChan:
@@ -381,6 +388,7 @@ func (r *Replica) messageLoop() {
             //got an Accept reply
             dlog.Printf("%d: Received AcceptReply for instance %d\n", r.Id, acceptReply.Instance)
             r.handleAcceptReply(acceptReply)
+            sendControl(control)
             break
 
         case fastAcceptReplyS := <-r.fastAcceptReplyChan:
@@ -388,9 +396,17 @@ func (r *Replica) messageLoop() {
             //got an Accept reply
             dlog.Printf("%d: Received FastAcceptReply for instance %d\n", r.Id, fastAcceptReply.Instance)
             r.handleFastAcceptReply(fastAcceptReply)
+            sendControl(control)
             break
         }
 
+    }
+}
+
+func sendControl(control chan bool){
+    log.Printf("Sent Control")
+    if(control !=  nil){
+        control <- true
     }
 }
 
@@ -414,7 +430,7 @@ func (r *Replica) updateCommittedUpTo() {
             r.committedUpTo++
         }
     }
-    dlog.Printf("Committed up to %d", r.committedUpTo)
+    dlog.Printf("%d Committed up to %d", r.Id, r.committedUpTo)
 }
 
 
@@ -695,7 +711,7 @@ func (r *Replica) handlePropose(propose *genericsmr.Propose) {
 }
 
 func (r *Replica) handlePrepare(prepare *optgpaxosproto.Prepare) {
-    dlog.Printf("Reply to 1A message with 1B message for instance %d with ballot", prepare.Instance, prepare.Ballot)
+    dlog.Printf("Reply to 1A message with 1B message for instance %d with ballot %d", prepare.Instance, prepare.Ballot)
     inst := r.instanceSpace[prepare.Instance]
     var preply *optgpaxosproto.PrepareReply
 
@@ -780,7 +796,7 @@ func (r *Replica) handleFastAccept(fastAccept *optgpaxosproto.FastAccept) {
 }
 
 func (r *Replica) handleAccept(accept *optgpaxosproto.Accept) {
-    dlog.Printf("Respond 2A message with 2B message for instance %d with ballot", accept.Instance, accept.Ballot)
+    dlog.Printf("Respond 2A message with 2B message for instance %d with ballot %d", accept.Instance, accept.Ballot)
     inst := r.instanceSpace[accept.Instance]
     C,D := r.getSeparateCommands(&accept.Cmds)
     var areply *optgpaxosproto.AcceptReply

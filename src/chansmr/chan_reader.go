@@ -41,7 +41,7 @@ func (r *ChanReader)  Read(p []byte) (n int, err error) {
             break
         }
 	}
-
+	//dlog.Printf("Read %d bytes", n)
 	return n, err
 }
 

@@ -1,7 +1,5 @@
 package chansmr
 
-import "dlog"
-
 type ChanWriter struct {
 	ch chan byte
 }
@@ -23,7 +21,7 @@ func (w *ChanWriter) Write(p []byte) (int, error) {
 		w.ch <- b
 		n++
 	}
-	dlog.Printf("wrote %d bytes", n)
+	//dlog.Printf("wrote %d bytes", n)
 	return n, nil
 }
 
