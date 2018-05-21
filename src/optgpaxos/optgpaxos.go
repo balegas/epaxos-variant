@@ -247,6 +247,14 @@ func (r *Replica) BeTheLeader(args *genericsmrproto.BeTheLeaderArgs, reply *gene
     return nil
 }
 
+func (r *Replica) revokeLeader(){
+    log.Println("No longer leader")
+    r.IsLeader = false
+    if(r.instanceSpace[r.crtInstance] != nil && r.instanceSpace[r.crtInstance].status != FINISHED){
+        r.instanceSpace[r.crtInstance].lb = nil
+    }
+}
+
 func (r *Replica) replyPrepare(replicaId int32, reply *optgpaxosproto.PrepareReply) {
     r.SendMsg(replicaId, r.prepareReplyRPC, reply)
 }
@@ -601,7 +609,7 @@ func (r *Replica) bcastAccept(instance int32, ballot int32, command map[state.Id
 }
 
 func (r *Replica) bcastCommit(instance int32, ballot int32, id state.Id, command []state.Command, deps []state.Id) {
-    dlog.Printf("Send Commit message")
+    dlog.Printf("Send Commit message for instance %v with id %v", instance, id)
     defer func() {
         if err := recover(); err != nil {
             log.Println("Commit bcast failed:", err)
@@ -770,8 +778,7 @@ func (r *Replica) handleFastAccept(fastAccept *optgpaxosproto.FastAccept) {
         dlog.Printf("Lower than current! %d < %d", inst.ballot, r.defaultBallot)
         areply = &optgpaxosproto.FastAcceptReply{fastAccept.Instance, FALSE, inst.ballot, fastAccept.Id, nil}
     } else if inst.ballot < fastAccept.Ballot {
-        dlog.Printf("SHOULD NEVER ENTER HERE - Cannot have a higher fast ballot number for the same instance")
-
+        areply = &optgpaxosproto.FastAcceptReply{fastAccept.Instance, FALSE, inst.ballot, fastAccept.Id, deps}
     } else {
         // fast path in same instance.
         if r.instanceSpace[fastAccept.Instance].status == FAST_ACCEPT {
@@ -779,12 +786,11 @@ func (r *Replica) handleFastAccept(fastAccept *optgpaxosproto.FastAccept) {
             inst.deps[fastAccept.Id] = deps
             inst.phase[fastAccept.Id] = ACCEPTED
             //inst.orderedIds = append(inst.orderedIds, fastAccept.Id)
-
-        } else {
-            dlog.Printf("SHOULD NEVER ENTER HERE - Similar reason as before")
+            areply = &optgpaxosproto.FastAcceptReply{fastAccept.Instance, TRUE, inst.ballot, fastAccept.Id, deps}
 
         }
-        areply = &optgpaxosproto.FastAcceptReply{fastAccept.Instance, TRUE, r.defaultBallot, fastAccept.Id, deps}
+            dlog.Printf("Current instance is not in FAST_ACCEPT mode.")
+        areply = &optgpaxosproto.FastAcceptReply{fastAccept.Instance, FALSE, inst.ballot, fastAccept.Id, deps}
     }
     if areply.OK == TRUE {
         r.recordInstanceMetadata(r.instanceSpace[fastAccept.Instance])
@@ -848,7 +854,7 @@ func (r *Replica) handleAccept(accept *optgpaxosproto.Accept) {
 
 func (r *Replica) handleCommit(commit *optgpaxosproto.Commit) {
     inst := r.instanceSpace[commit.Instance]
-    dlog.Printf("Handle commit for instance %d.", commit.Instance)
+    dlog.Printf("Handle commit for instance %d with id %v.", commit.Instance, commit.Id)
 
     if inst == nil {
         inst = newInstance(false)
@@ -962,15 +968,18 @@ func (r *Replica) handleFastAcceptReply(areply *optgpaxosproto.FastAcceptReply) 
         return;
     }
 
-    if inst.status != PREPARED && inst.status != FAST_ACCEPT{
+    if /*inst.status != PREPARED &&*/ inst.status != FAST_ACCEPT{
+        dlog.Printf("Message ignored. NOT FAST_ACCEPT.")
         // we've move on, these are delayed replies, so just ignore
         return
     }
 
     if areply.OK == TRUE {
         allEqual := true
-        dlog.Printf("Dep vector %d, len: %d", inst.deps[areply.Id], len(inst.deps[areply.Id]))
-        if(inst.deps[areply.Id] != nil){
+        if(len(inst.deps[areply.Id]) != len(areply.Deps)){
+            allEqual = false
+        } else {
+            dlog.Printf("Dep vector %d, len: %d", inst.deps[areply.Id], len(inst.deps[areply.Id]))
             for i, depi := range areply.Deps {
                 if(inst.deps[areply.Id][i] != depi){
                     allEqual = false;
@@ -979,14 +988,19 @@ func (r *Replica) handleFastAcceptReply(areply *optgpaxosproto.FastAcceptReply) 
             }
         }
         if allEqual {
-            dlog.Printf("Got same dependency vector for %v, instance %v. Vector size: %d", areply.Id, areply.Instance, len(inst.deps[areply.Id]))
+            dlog.Printf("Dep check OK for instance %v with id %v: %d", areply.Instance, areply.Id, len(inst.deps[areply.Id]))
             inst.lb.fastAcceptOKs[areply.Id]++
+            dlog.Printf("Min OKs: %d, got: %d", int(math.Ceil(3*float64(r.N)/4))-1, inst.lb.fastAcceptOKs[areply.Id])
+
+        } else{
+            inst.lb.fastAcceptNOKs[areply.Id]++
+            dlog.Printf("Max NOKs : %d, got: %d", int(math.Ceil(1*float64(r.N)/4))-1, inst.lb.fastAcceptNOKs[areply.Id])
         }
         if inst.lb.fastAcceptOKs[areply.Id] > int(math.Ceil(3*float64(r.N)/4))-1 {
             inst = r.instanceSpace[areply.Instance]
             inst.phase[areply.Id] = COMMITTED
             r.bcastCommit(areply.Instance, inst.ballot, areply.Id, inst.cmds[areply.Id], inst.deps[areply.Id])
-            //TODO: See executeCommands
+
             if inst.lb.proposalsById[areply.Id] != nil && !r.Dreply {
                 // give client the all clear
                 for i := 0; i < len(inst.cmds[areply.Id]); i++ {
@@ -1002,17 +1016,30 @@ func (r *Replica) handleFastAcceptReply(areply *optgpaxosproto.FastAcceptReply) 
             r.recordInstanceMetadata(r.instanceSpace[areply.Instance])
             r.sync() //is this necessary?
             r.updateCommittedUpTo()
+        } else if inst.lb.fastAcceptNOKs[areply.Id] > int(math.Ceil(1*float64(r.N)/4)-1){
+            //TODO: Must use previous write quorum??
+            dlog.Printf("Collision recovery")
+            inst.status = SLOW_ACCEPT
+            r.recordInstanceMetadata(r.instanceSpace[areply.Instance])
+            r.sync()
+            r.bcastAccept(areply.Instance, inst.ballot, inst.cmds, inst.deps)
+
         }
+
+
     } else {
         dlog.Printf("There is another active leader (", areply.Ballot, " > ", r.maxRecvBallot, ")")
         inst.lb.fastAcceptNOKs[areply.Id]++
         if areply.Ballot > r.maxRecvBallot {
             r.maxRecvBallot = areply.Ballot
+
+            //TODO: Must test leader change.
+            if(r.IsLeader){
+                r.revokeLeader()
+            }
+
         }
-        if inst.lb.nacks > r.N >> 1 {
-            dlog.Printf("Recovery not implemented")
-            // TODO
-        }
+
     }
 }
 
@@ -1021,6 +1048,7 @@ func (r *Replica) handleAcceptReply(areply *optgpaxosproto.AcceptReply) {
     inst := r.instanceSpace[areply.Instance]
 
     if inst.status != PREPARED && inst.status != SLOW_ACCEPT {
+        dlog.Printf("Message ignored. NOT PREPARED OR SLOW_ACCEPT")
         // we've move on, these are delayed replies, so just ignore
         return
     }
