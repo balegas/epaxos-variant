@@ -273,7 +273,7 @@ func (r *Replica) replicaListener(rid int, reader *bufio.Reader) {
 			if err = gbeaconReply.Unmarshal(reader); err != nil {
 				break
 			}
-			dlog.Println("receive beacon ", gbeaconReply.Timestamp, " reply from ",rid)
+			//dlog.Println("receive beacon ", gbeaconReply.Timestamp, " reply from ",rid)
 			//TODO: UPDATE STUFF
 			r.Mutex.Lock()
 			r.Latencies[rid] += time.Now().UnixNano() - gbeaconReply.Timestamp
@@ -412,12 +412,12 @@ func (r *Replica) SendBeacon(peerId int32) {
 	beacon := &genericsmrproto.Beacon{Timestamp: time.Now().UnixNano()}
 	beacon.Marshal(w)
 	w.Flush()
-	dlog.Println("send beacon ", beacon.Timestamp, " to ", peerId)
+	//dlog.Println("send beacon ", beacon.Timestamp, " to ", peerId)
 	r.Mutex.Unlock()
 }
 
 func (r *Replica) ReplyBeacon(beacon *Beacon) {
-	dlog.Println("replying beacon to ",beacon.Rid)
+	//dlog.Println("replying beacon to ",beacon.Rid)
 	r.Mutex.Lock()
 	w := r.PeerWriters[beacon.Rid]
 	if w==nil{

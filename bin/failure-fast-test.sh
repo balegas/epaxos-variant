@@ -1,0 +1,139 @@
+#!/usr/bin/env bash
+
+LOGS=logs
+
+NSERVERS=5
+NCLIENTS=1
+CMDS=1
+PSIZE=32
+TOTAL_OPS=$(( NCLIENTS * CMDS ))
+
+MASTER=bin/master
+SERVER=bin/server
+CLIENT=bin/client
+
+DIFF_TOOL=diff
+#DIFF_TOOL=merge
+
+failure=1
+
+#HACKS
+mkdir -p logs
+if [[ $OSTYPE == 'darwin17' ]];
+then
+    PS_AUX="ps aux"
+else
+    PS_AUX="ps -aux"
+fi
+
+master() {
+    touch ${LOGS}/m.txt
+    ${MASTER} -N ${NSERVERS} > "${LOGS}/m.txt" 2>&1 &
+    tail -f ${LOGS}/m.txt &
+}
+
+servers() {
+    echo ">>>>> Starting servers..."
+    for i in $(seq 1 ${NSERVERS}); do
+	port=$(( 7000 + $i ))
+	${SERVER}\
+	    -lread \
+	    -exec \
+	    -thrifty \
+      -o \
+	    -port ${port} > "${LOGS}/s_$i.txt" 2>&1 &
+    done
+
+    up=-1
+    while [ ${up} != ${NSERVERS} ]; do
+	up=$(cat logs/s_*.txt | grep "Waiting for client connections" | wc -l)
+	sleep 1
+    done
+    echo ">>>>> Servers up!"
+}
+
+clients() {
+    echo ">>>>> Starting clients..."
+	${CLIENT} -v \
+		  -q 3 \
+		  -w 100 \
+		  -c 100 \
+		  -l \
+      -psize ${PSIZE} > "${LOGS}/c_before.txt" 2>&1 &
+
+
+  sleep 20
+  leader=$(grep "new leader" ${LOGS}/m.txt | tail -n 1 | awk '{print $4}')
+	port=$(grep "node ${leader}" ${LOGS}/m.txt | sed -n 's/.*\(:.*\]\).*/\1/p' | sed 's/[]:]//g')
+	pid=$(ps -ef | grep "bin/server" | grep "${port}" | awk '{print $2}')
+	echo ">>>>> Injecting failure... (${leader}, ${port}, ${pid})"
+	kill -9 ${pid}
+
+  ${CLIENT} -v \
+      -q 3 \
+      -w 100 \
+      -c 100 \
+      -l \
+      -psize ${PSIZE} > "${LOGS}/c_after.txt" 2>&1 &
+
+  sleep 20
+}
+
+stop_all() {
+    echo ">>>>> Stopping All"
+    for p in ${CLIENT} ${SERVER} ${MASTER}; do
+	$PS_AUX | grep ${p} | awk '{ print $2 }' | xargs kill -9 >& /dev/null
+    done
+    $PS_AUX | grep "tail -f ${LOGS}/m.txt" | awk '{ print $2 }' | xargs kill -9 >& /dev/null
+    true
+}
+
+start_exp() {
+    rm -rf ${LOGS}/*
+    stop_all
+}
+
+end_exp() {
+    all=()
+    for i in $(seq 1 ${NSERVERS}); do
+	f="${LOGS}/$i.ops"
+	cat "${LOGS}/s_$i.txt" | grep "Executing" | cut -d',' -f 2 | cut -d' ' -f 2 > ${f}
+	all+=(${f})
+    done
+
+    echo ">>>>> Will check total order..."
+    case ${DIFF_TOOL} in
+	diff)
+	    for i in $(seq 2 ${NSERVERS}); do
+		diff "${LOGS}/1.ops" "${LOGS}/$i.ops" > /dev/null
+	    done
+	    ;;
+	merge)
+	    i=1
+	    paste -d: ${all[@]} | while read -r line ; do
+		if [ $((i % 1000)) == 0 ]; then
+		    echo ">>>>> Checked ${i} of ${TOTAL_OPS}..."
+		fi
+		unique=$(echo ${line} | sed 's/:/\n/g' | sort -u | wc -l)
+		if [ "${unique}" != "1" ]; then
+		    echo -e "#${i}:\n$(echo ${line} | sed 's/:/\n/g')"
+		fi
+		i=$(( i + 1 ))
+	    done
+	    ;;
+	*)
+	    echo "Invalid diff tool!"
+	    exit -1
+    esac
+
+}
+
+trap "stop_all; exit 255" SIGINT SIGTERM
+
+start_exp
+master
+servers
+clients
+end_exp
+
+stop_all
