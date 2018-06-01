@@ -32,11 +32,15 @@ type Command struct {
 
 
 type FullCmds struct {
-	C [][]Command
-	D [][]Id
+	Id	[]Id
+	C 	[][]Command
+	D	[][]Id
+	P	[]Phase
 }
 
 type Id int64
+type Phase int8
+
 
 func NOOP() []Command {return []Command {{NONE, 0, NIL()}}}
 

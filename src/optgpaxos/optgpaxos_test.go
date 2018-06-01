@@ -12,6 +12,7 @@ import (
     "math/rand"
     "optgpaxosproto"
     "log"
+    "math"
 )
 
 
@@ -31,7 +32,7 @@ var leaderIOChan *bufio.ReadWriter
 var mutex *sync.Mutex
 var control = make(chan bool)
 
-func initReplicas(count int) []*RepChan{
+func initReplicas(count int, thrifty bool) []*RepChan{
     ret := make([]*RepChan, count)
     isLeader := true
 
@@ -54,11 +55,12 @@ func initReplicas(count int) []*RepChan{
             make(chan fastrpc.Serializable, BufferSize),
             make(chan fastrpc.Serializable, BufferSize),
             make(chan fastrpc.Serializable, BufferSize),
+            make(chan fastrpc.Serializable, BufferSize),
         }
 
         ret[i] = &RepChan{
             repiChan,
-            NewReplicaStub(i, make([]string, count), isLeader, true, false, false, false, false, repiChan, connections, control),
+            NewReplicaStub(i, make([]string, count), isLeader, thrifty, false, false, false, false, repiChan, connections, control),
         }
 
         isLeader = false
@@ -66,8 +68,8 @@ func initReplicas(count int) []*RepChan{
     return ret
 }
 
-func setup(replicaCount int){
-    reps = initReplicas(replicaCount)
+func setup(replicaCount int, thrifty bool){
+    reps = initReplicas(replicaCount, thrifty)
     leaderChan := make(chan byte, BufferSize)
     proposeChanR := bufio.NewReader(chansmr.NewChanReader(leaderChan))
     proposeChanW := bufio.NewWriter(chansmr.NewChanWriter(leaderChan))
@@ -75,33 +77,57 @@ func setup(replicaCount int){
     mutex = &sync.Mutex{}
 }
 
-func TestClassicRound(t *testing.T) {
-  setup(3)
+func TestInitFastRound(t *testing.T) {
+    setup(3, true)
+    reps[0].C.proposeChan <- &genericsmr.Propose{createProposal(0, state.PUT, 0, 0), leaderIOChan.Writer, mutex}
+    <- control
+
+    fastAccepts := make([]optgpaxosproto.FastAccept, len(reps))
+    for i := 1; i < len(reps); i++{
+        msg :=  &optgpaxosproto.FastAccept{}
+        code := make([]byte,1)
+        connections[int32(i)].is.Read(code)
+        msg.Unmarshal(connections[int32(i)].is)
+    }
+
+    for _, p := range fastAccepts{
+        if p.Ballot != 0 {
+            t.Errorf("Wrong ballot number.")
+        }
+        if p.LeaderId!= 0{
+            t.Errorf("Wrong leader id.")
+        }
+    }
+
+}
+
+func TestFirstRound(t *testing.T) {
+  setup(3, true)
   reps[0].C.proposeChan <- &genericsmr.Propose{createProposal(0, state.PUT, 0, 0), leaderIOChan.Writer, mutex}
   <- control
- executeSlowPath()
+  executeFastPath()
 
   reply := new(genericsmrproto.ProposeReplyTS)
   reply.Unmarshal(leaderIOChan.Reader)
   log.Printf("Reply: %v", reply)
   if reply.OK != 1 {
-      t.Errorf("Failed Classic Round.")
+      t.Errorf("Failed Fast Round.")
   }
 }
 
-func TestFastRound(t *testing.T) {
-   setup(3)
+func TestTwoFastRound(t *testing.T) {
+   setup(5, true)
 
    reps[0].C.proposeChan <- &genericsmr.Propose{createProposal(0, state.PUT, 0, 0), leaderIOChan.Writer, mutex}
    <- control
 
-   executeSlowPath()
+   executeFastPath()
 
    reply := new(genericsmrproto.ProposeReplyTS)
    reply.Unmarshal(leaderIOChan.Reader)
    log.Printf("Reply: %v", reply)
    if reply.OK != 1 {
-       t.Errorf("Failed Classic Round.")
+       t.Errorf("Failed FAST Round.")
    }
 
    reps[0].C.proposeChan <- &genericsmr.Propose{createProposal(1, state.PUT, 1, 1), leaderIOChan.Writer, mutex}
@@ -117,11 +143,59 @@ func TestFastRound(t *testing.T) {
    }
 }
 
-func TestFastRoundMsgReorder(t *testing.T) {
-    setup(3)
+func TestNFastRound(t *testing.T) {
+    setup(7, true)
+
+    for i := 1; i <= 10; i++ {
+        reps[0].C.proposeChan <- &genericsmr.Propose{createProposal(int32(i), state.PUT, state.Key(i), int64(i)), leaderIOChan.Writer, mutex}
+        <- control
+
+        executeFastPath()
+
+        reply := new(genericsmrproto.ProposeReplyTS)
+        reply.Unmarshal(leaderIOChan.Reader)
+        log.Printf("Reply: %v", reply)
+        if reply.OK != 1 {
+            t.Errorf("Failed FAST Round.")
+        }
+    }
+}
+
+func TestRepeatedId(t *testing.T) {
+    setup(3, true)
+
     reps[0].C.proposeChan <- &genericsmr.Propose{createProposal(0, state.PUT, 0, 0), leaderIOChan.Writer, mutex}
     <- control
-    executeSlowPath()
+
+    executeFastPath()
+
+    reply := new(genericsmrproto.ProposeReplyTS)
+    reply.Unmarshal(leaderIOChan.Reader)
+    log.Printf("Reply: %v", reply)
+    if reply.OK != 1 {
+        t.Errorf("Failed FAST Round.")
+    }
+
+    reps[0].C.proposeChan <- &genericsmr.Propose{createProposal(0, state.PUT, 0, 0), leaderIOChan.Writer, mutex}
+    <- control
+
+    reply = new(genericsmrproto.ProposeReplyTS)
+    reply.Unmarshal(leaderIOChan.Reader)
+    log.Printf("Reply: %v", reply)
+    if reply.OK != 0 {
+        t.Errorf("Should ignore repeated command")
+    }
+
+}
+
+func TestFastRoundReorderNoConflict(t *testing.T) {
+    setup(3, true)
+    fQ := int(math.Ceil(3*float64(len(reps))/4))
+
+    reps[0].C.proposeChan <- &genericsmr.Propose{createProposal(0, state.PUT, 0, 0), leaderIOChan.Writer, mutex}
+    <- control
+
+    executeFastPath()
 
     reply := new(genericsmrproto.ProposeReplyTS)
     reply.Unmarshal(leaderIOChan.Reader)
@@ -135,7 +209,7 @@ func TestFastRoundMsgReorder(t *testing.T) {
 
 
     fastAccepts1 := make([]fastrpc.Serializable, len(reps))
-    for i := 1; i < len(reps); i++{
+    for i := 1; i < fQ; i++{
         fastAccepts1[i] = readMessage(int32(i), new(optgpaxosproto.FastAccept))
     }
 
@@ -153,7 +227,7 @@ func TestFastRoundMsgReorder(t *testing.T) {
     mixedAcceptReplies1[1] = processMsgAndGetReply(fastAcceptChan(1), fastAccepts1[1], true, 0, new(optgpaxosproto.FastAcceptReply))
     mixedAcceptReplies1[2] = processMsgAndGetReply(fastAcceptChan(2), fastAccepts2[2], true, 0, new(optgpaxosproto.FastAcceptReply))
 
-    for i := 1; i < len(reps); i++{
+    for i := 1; i < fQ; i++{
         processMsg(fastAcceptReplyChan(0), mixedAcceptReplies1[i], true)
     }
 
@@ -181,7 +255,7 @@ func TestFastRoundMsgReorder(t *testing.T) {
     }
 
     for i := 1; i < len(reps); i++{
-        processMsg(commitChan(0), commits2[i], true)
+        processMsg(commitChan(int32(i)), commits2[i], true)
     }
 
     reply = new(genericsmrproto.ProposeReplyTS)
@@ -200,11 +274,14 @@ func TestFastRoundMsgReorder(t *testing.T) {
 }
 
 
-func TestFastRoundMsgConflict(t *testing.T) {
-    setup(3)
+func TestFastRoundReorderConflict(t *testing.T) {
+    setup(3, true)
+    fQ := int(math.Ceil(3*float64(len(reps))/4))
+    q := int(math.Ceil(float64(len(reps))/2))
+
     reps[0].C.proposeChan <- &genericsmr.Propose{createProposal(0, state.PUT, 0, 0), leaderIOChan.Writer, mutex}
     <- control
-    executeSlowPath()
+    executeFastPath()
 
     reply := new(genericsmrproto.ProposeReplyTS)
     reply.Unmarshal(leaderIOChan.Reader)
@@ -216,9 +293,8 @@ func TestFastRoundMsgConflict(t *testing.T) {
     reps[0].C.proposeChan <- &genericsmr.Propose{createProposal(1, state.PUT, 1, 1), leaderIOChan.Writer, mutex}
     <- control
 
-
     fastAccepts1 := make([]fastrpc.Serializable, len(reps))
-    for i := 1; i < len(reps); i++{
+    for i := 1; i < fQ; i++{
         fastAccepts1[i] = readMessage(int32(i), new(optgpaxosproto.FastAccept))
     }
 
@@ -226,31 +302,30 @@ func TestFastRoundMsgConflict(t *testing.T) {
     <- control
 
     fastAccepts2 := make([]fastrpc.Serializable, len(reps))
-    for i := 1; i < len(reps); i++{
+    for i := 1; i < fQ; i++{
         fastAccepts2[i] = readMessage(int32(i), new(optgpaxosproto.FastAccept))
     }
-
 
     //Mix delivery order:
     mixedAcceptReplies1 := make([]fastrpc.Serializable, len(reps))
     mixedAcceptReplies1[1] = processMsgAndGetReply(fastAcceptChan(1), fastAccepts1[1], true, 0, new(optgpaxosproto.FastAcceptReply))
     mixedAcceptReplies1[2] = processMsgAndGetReply(fastAcceptChan(2), fastAccepts2[2], true, 0, new(optgpaxosproto.FastAcceptReply))
 
-    for i := 1; i < len(reps); i++{
+    for i := 1; i < fQ; i++{
         processMsg(fastAcceptReplyChan(0), mixedAcceptReplies1[i], true)
     }
 
     accepts1 := make([]fastrpc.Serializable, len(reps))
-    for i := 1; i < len(reps); i++{
+    for i := 1; i < q; i++{
         accepts1[i] = readMessage(int32(i), new(optgpaxosproto.Accept))
     }
 
     acceptReplies := make([]fastrpc.Serializable, len(reps))
-    for i := 1; i < len(reps); i++{
+    for i := 1; i < q; i++{
         acceptReplies[i] = processMsgAndGetReply(acceptChan(int32(i)), accepts1[i], true, 0, new(optgpaxosproto.AcceptReply))
     }
 
-    //Ignores fast accepts after moving to slow ballot.
+    //Ignores fast accepts after moving to slow phase.
     processMsg(fastAcceptChan(1), fastAccepts1[1], true)
     msg := new(optgpaxosproto.FastAcceptReply)
     code := make([]byte,1)
@@ -261,17 +336,17 @@ func TestFastRoundMsgConflict(t *testing.T) {
         t.Errorf("Accepted fast accept after moving to slow ballot.")
     }
 
-    for i := 1; i < len(reps); i++{
+    for i := 1; i < q; i++{
         processMsg(acceptReplyChan(0), acceptReplies[i], true)
     }
 
-    fullCommits := make([]fastrpc.Serializable, len(reps))
+    commits := make([]fastrpc.Serializable, len(reps))
     for i := 1; i < len(reps); i++{
-        fullCommits[i] = readMessage(int32(i), new(optgpaxosproto.FullCommit))
+        commits[i] = readMessage(int32(i), new(optgpaxosproto.Commit))
     }
 
     for i := 1; i < len(reps); i++{
-        processMsg(fullCommitChan(int32(i)), fullCommits[i], true)
+        processMsg(commitChan(int32(i)), commits[i], true)
     }
 
 
@@ -279,54 +354,160 @@ func TestFastRoundMsgConflict(t *testing.T) {
     // Deliver second pair of reordered messages
     mixedAcceptReplies2 := make([]fastrpc.Serializable, len(reps))
     mixedAcceptReplies2[1] = processMsgAndGetReply(fastAcceptChan(1), fastAccepts2[1], true, 0, new(optgpaxosproto.FastAcceptReply))
-    mixedAcceptReplies2[2] = processMsgAndGetReply(fastAcceptChan(2), fastAccepts2[2], true, 0, new(optgpaxosproto.FastAcceptReply))
+    mixedAcceptReplies2[2] = processMsgAndGetReply(fastAcceptChan(2), fastAccepts1[2], true, 0, new(optgpaxosproto.FastAcceptReply))
 
     for i := 1; i < len(reps); i++{
         processMsg(fastAcceptReplyChan(0), mixedAcceptReplies2[i], true)
+    }
+
+    accepts2 := make([]fastrpc.Serializable, len(reps))
+    for i := 1; i < len(reps); i++{
+        accepts2[i] = readMessage(int32(i), new(optgpaxosproto.Accept))
+    }
+
+    acceptReplies2 := make([]fastrpc.Serializable, len(reps))
+    for i := 1; i < len(reps); i++{
+        acceptReplies2[i] = processMsgAndGetReply(acceptChan(int32(i)), accepts2[i], true, 0, new(optgpaxosproto.AcceptReply))
+    }
+
+    for i := 1; i < len(reps); i++{
+        processMsg(acceptReplyChan(0), acceptReplies2[i], true)
+    }
+
+    commits2 := make([]fastrpc.Serializable, len(reps))
+    for i := 1; i < len(reps); i++{
+        commits2[i] = readMessage(int32(i), new(optgpaxosproto.Commit))
+    }
+
+    for i := 1; i < len(reps); i++{
+        processMsg(commitChan(int32(i)), commits2[i], true)
     }
 
     reply = new(genericsmrproto.ProposeReplyTS)
     reply.Unmarshal(leaderIOChan.Reader)
     log.Printf("Reply: %v", reply)
     if reply.OK != 1 && reply.CommandId != 1{
-        t.Errorf("Failed Classic Round.")
+        t.Errorf("Failed Slow Accept.")
     }
 
     reply = new(genericsmrproto.ProposeReplyTS)
     reply.Unmarshal(leaderIOChan.Reader)
     log.Printf("Reply: %v", reply)
     if reply.OK != 1 && reply.CommandId != 2 {
-        t.Errorf("Failed Classic Round.")
+        t.Errorf("Failed Slow Accept.")
     }
+}
 
-    //Try to do a new fast message and observe that it increases the instance number.
-    reps[0].C.proposeChan <- &genericsmr.Propose{createProposal(3, state.PUT, 3, 3), leaderIOChan.Writer, mutex}
-    <- control
+func TestFastRoundMsgNoConflict5Replicas(t *testing.T) {
+    //In this test, the fast accept message must be sent to all replicas.
+    // With thirfty=true, if at least one message is reordered, then it is no longer possible to get fQ equal responses.
+    setup(5, false)
 
+    reps[0].C.proposeChan <- &genericsmr.Propose{createProposal(0, state.PUT, 0, 0), leaderIOChan.Writer, mutex}
+    <-control
     executeFastPath()
 
+    reply := new(genericsmrproto.ProposeReplyTS)
+    reply.Unmarshal(leaderIOChan.Reader)
+    log.Printf("Reply: %v", reply)
+    if reply.OK != 1 {
+        t.Errorf("Failed Classic Round.")
+    }
+
+    reps[0].C.proposeChan <- &genericsmr.Propose{createProposal(1, state.PUT, 1, 1), leaderIOChan.Writer, mutex}
+    <-control
+
+    fastAccepts1 := make([]fastrpc.Serializable, len(reps))
+    for i := 1; i < len(reps); i++ {
+        fastAccepts1[i] = readMessage(int32(i), new(optgpaxosproto.FastAccept))
+    }
+
+    reps[0].C.proposeChan <- &genericsmr.Propose{createProposal(2, state.PUT, 1, 2), leaderIOChan.Writer, mutex}
+    <-control
+
+    fastAccepts2 := make([]fastrpc.Serializable, len(reps))
+    for i := 1; i < len(reps); i++ {
+        fastAccepts2[i] = readMessage(int32(i), new(optgpaxosproto.FastAccept))
+    }
+
+    //Mix delivery order:
+    mixedAcceptReplies1 := make([]fastrpc.Serializable, len(reps))
+    mixedAcceptReplies1[1] = processMsgAndGetReply(fastAcceptChan(1), fastAccepts1[1], true, 0, new(optgpaxosproto.FastAcceptReply))
+    mixedAcceptReplies1[2] = processMsgAndGetReply(fastAcceptChan(2), fastAccepts2[2], true, 0, new(optgpaxosproto.FastAcceptReply))
+    mixedAcceptReplies1[3] = processMsgAndGetReply(fastAcceptChan(3), fastAccepts1[3], true, 0, new(optgpaxosproto.FastAcceptReply))
+    mixedAcceptReplies1[4] = processMsgAndGetReply(fastAcceptChan(4), fastAccepts1[4], true, 0, new(optgpaxosproto.FastAcceptReply))
+
+    for i := 1; i < len(reps); i++ {
+        processMsg(fastAcceptReplyChan(0), mixedAcceptReplies1[i], true)
+    }
+
+    commits1 := make([]fastrpc.Serializable, len(reps))
+    for i := 1; i < len(reps); i++ {
+        commits1[i] = readMessage(int32(i), new(optgpaxosproto.Commit))
+    }
+
+    for i := 1; i < len(reps); i++ {
+        processMsg(commitChan(int32(i)), commits1[i], true)
+    }
+
+    // Deliver second pair of reordered messages
+    mixedAcceptReplies2 := make([]fastrpc.Serializable, len(reps))
+    mixedAcceptReplies2[1] = processMsgAndGetReply(fastAcceptChan(1), fastAccepts2[1], true, 0, new(optgpaxosproto.FastAcceptReply))
+    mixedAcceptReplies2[2] = processMsgAndGetReply(fastAcceptChan(2), fastAccepts1[2], true, 0, new(optgpaxosproto.FastAcceptReply))
+    mixedAcceptReplies2[3] = processMsgAndGetReply(fastAcceptChan(3), fastAccepts2[3], true, 0, new(optgpaxosproto.FastAcceptReply))
+    mixedAcceptReplies2[4] = processMsgAndGetReply(fastAcceptChan(4), fastAccepts2[4], true, 0, new(optgpaxosproto.FastAcceptReply))
+
+    for i := 1; i < len(reps); i++ {
+        processMsg(fastAcceptReplyChan(0), mixedAcceptReplies1[i], true)
+    }
+
+    commits2 := make([]fastrpc.Serializable, len(reps))
+    for i := 1; i < len(reps); i++ {
+        commits2[i] = readMessage(int32(i), new(optgpaxosproto.Commit))
+    }
+
+    for i := 1; i < len(reps); i++ {
+        processMsg(commitChan(int32(i)), commits2[i], true)
+    }
+
+
+    reply = new(genericsmrproto.ProposeReplyTS)
+    reply.Unmarshal(leaderIOChan.Reader)
+    log.Printf("Reply: %v", reply)
+    if reply.OK != 1 && reply.CommandId != 1{
+        t.Errorf("Failed Slow Accept.")
+    }
+
     reply = new(genericsmrproto.ProposeReplyTS)
     reply.Unmarshal(leaderIOChan.Reader)
     log.Printf("Reply: %v", reply)
     if reply.OK != 1 && reply.CommandId != 2 {
-        t.Errorf("Failed FAST Round.")
+        t.Errorf("Failed Slow Accept.")
     }
-
 }
+
+
+
+//Test collision recovery with larger quorum
+
+//Test delivery order
 
 func executeFastPath(){
     fastAccepts := make([]fastrpc.Serializable, len(reps))
-    for i := 1; i < len(reps); i++{
+
+    fQ := int(math.Ceil(3*float64(len(reps))/4))
+
+    for i := 1; i < fQ; i++{
         fastAccepts[i] = readMessage(int32(i), new(optgpaxosproto.FastAccept))
     }
 
-    fastAacceptReplies := make([]fastrpc.Serializable, len(reps))
-    for i := 1; i < len(reps); i++{
-        fastAacceptReplies[i] = processMsgAndGetReply(fastAcceptChan(int32(i)), fastAccepts[i], true, 0, new(optgpaxosproto.FastAcceptReply))
+    fastAcceptReplies := make([]fastrpc.Serializable, fQ)
+    for i := 1; i < fQ; i++{
+        fastAcceptReplies[i] = processMsgAndGetReply(fastAcceptChan(int32(i)), fastAccepts[i], true, 0, new(optgpaxosproto.FastAcceptReply))
     }
 
-    for i := 1; i < len(reps); i++{
-        processMsg(fastAcceptReplyChan(0), fastAacceptReplies[i], true)
+    for i := 1; i < fQ; i++{
+        processMsg(fastAcceptReplyChan(0), fastAcceptReplies[i], true)
     }
 
     commits := make([]fastrpc.Serializable, len(reps))
@@ -335,49 +516,7 @@ func executeFastPath(){
     }
 
     for i := 1; i < len(reps); i++{
-       processMsg(commitChan(0), commits[i], true)
-    }
-
-}
-
-
-func executeSlowPath(){
-
-    prepares := make([]fastrpc.Serializable, len(reps))
-    for i := 1; i < len(reps); i++{
-        prepares[i] = readMessage(int32(i), new(optgpaxosproto.Prepare))
-    }
-
-    prepareReplies := make([]fastrpc.Serializable, len(reps))
-    for i := 1; i < len(reps); i++{
-        prepareReplies[i] = processMsgAndGetReply(prepareChan(int32(i)), prepares[i], true, 0, new(optgpaxosproto.PrepareReply))
-    }
-
-    for i := 1; i < len(reps); i++{
-        processMsg(prepareReplyChan(0), prepareReplies[i], true)
-    }
-
-    accepts := make([]fastrpc.Serializable, len(reps))
-    for i := 1; i < len(reps); i++{
-        accepts[i] = readMessage(int32(i), new(optgpaxosproto.Accept))
-    }
-
-    acceptReplies := make([]fastrpc.Serializable, len(reps))
-    for i := 1; i < len(reps); i++{
-        acceptReplies[i] = processMsgAndGetReply(acceptChan(int32(i)), accepts[i], true, 0, new(optgpaxosproto.AcceptReply))
-    }
-
-    for i := 1; i < len(reps); i++{
-        processMsg(acceptReplyChan(0), acceptReplies[i], true)
-    }
-
-    fullCommits := make([]fastrpc.Serializable, len(reps))
-    for i := 1; i < len(reps); i++{
-        fullCommits[i] = readMessage(int32(i), new(optgpaxosproto.FullCommit))
-    }
-
-    for i := 1; i < len(reps); i++{
-        processMsg(fullCommitChan(int32(i)), fullCommits[i], true)
+       processMsg(commitChan(int32(i)), commits[i], true)
     }
 
 }
@@ -437,8 +576,8 @@ func commitChan(rId int32) chan fastrpc.Serializable {
     return reps[rId].C.commitChan
 }
 
-func fullCommitChan(rId int32) chan fastrpc.Serializable {
-    return reps[rId].C.fullCommitChan
+func syncChan(rId int32) chan fastrpc.Serializable {
+    return reps[rId].C.syncChan
 }
 
 
