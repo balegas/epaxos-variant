@@ -2,18 +2,6 @@ package optgpaxosproto
 
 import "state"
 
-type Prepare struct {
-	LeaderId   int32
-	Ballot     int32
-	ToInfinity uint8
-}
-
-type PrepareReply struct {
-    Ballot   int32
-    OK       uint8
-    Cmds     state.FullCmds
-}
-
 type FastAccept struct {
     LeaderId int32
     Ballot   int32
@@ -63,4 +51,17 @@ type SyncReply struct {
     Ballot   int32
     OK       uint8
 
+}
+
+type NewLeader struct {
+    LeaderId int32
+    Ballot   int32
+}
+
+type NewLeaderReply struct {
+    LeaderId int32
+    ReplicaId int32
+    Ballot   int32
+    CBallot  int32
+    Cmds     state.FullCmds
 }

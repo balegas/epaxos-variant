@@ -4,7 +4,7 @@ LOGS=logs
 
 NSERVERS=5
 NCLIENTS=1
-CMDS=3
+CMDS=300
 PSIZE=32
 TOTAL_OPS=$(( NCLIENTS * CMDS ))
 failure=0
@@ -54,7 +54,7 @@ clients() {
 	${CLIENT} -v \
 		  -q ${CMDS} \
 		  -w 100 \
-		  -c 0 \
+		  -c 50 \
 		  -l \
 		  -psize ${PSIZE} > "${LOGS}/c_$i.txt" 2>&1 &
     done

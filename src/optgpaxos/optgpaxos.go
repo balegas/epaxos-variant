@@ -15,12 +15,10 @@ import (
     "fmt"
     "bufio"
     "chansmr"
+    "sync"
 )
 
-//TODO: Store a sequence of commands per process, instead of a partial order?
 //TODO: Add short commit again
-//TODO: I disabled thrifty optimization and send messages to the quorum size.
-// See broadCast operations and compare with original paxos implementation.
 
 //const CHAN_BUFFER_SIZE = 200000
 const TRUE = uint8(1)
@@ -29,15 +27,15 @@ const MAX_BATCH = 1
 
 type Replica struct {
     *genericsmr.Replica // extends a generic Paxos replica
-    prepareChan         chan fastrpc.Serializable
     acceptChan          chan fastrpc.Serializable
     fastAcceptChan      chan fastrpc.Serializable
     commitChan          chan fastrpc.Serializable
-    syncChan          chan fastrpc.Serializable
-    prepareReplyChan    chan fastrpc.Serializable
+    newLeaderChan       chan fastrpc.Serializable
+    syncChan            chan fastrpc.Serializable
     acceptReplyChan     chan fastrpc.Serializable
     fastAcceptReplyChan chan fastrpc.Serializable
-    syncReplyChan     chan fastrpc.Serializable
+    newLeaderReplyChan  chan fastrpc.Serializable
+    syncReplyChan       chan fastrpc.Serializable
     prepareRPC          uint8
     acceptRPC           uint8
     fastAcceptRPC       uint8
@@ -49,22 +47,20 @@ type Replica struct {
     acceptReplyRPC      uint8
     fastAcceptReplyRPC  uint8
     syncReplyRPC        uint8
+    newLeaderRPC        uint8
+    newLeaderReplyRPC   uint8
     status              Status
-    /*IsLeader            bool*/        // does this replica think it is the leader
-    /*instanceSpace       map[int32]*Instance*/ // the space of all instances (used and not yet used)
-    /*crtInstance         int32*/       // highest active instance number that this replica knows about
-    defaultBallot       int32       // default ballot for new instances (0 until a Prepare(ballot, instance->infinity) from a leader)
     maxRecvBallot       int32
-    currBallot          int32
+    bal                 int32
+    cbal                int32
     Shutdown            bool
-    /*counter             int*/
     flush               bool
-    /*committedUpTo       int32*/
-    forceNewBallot      bool
-    cmds     map[state.Id][]state.Command
-    deps     map[state.Id][]state.Id
-    phase    map[state.Id]Phase
-    lb       *LeaderBookkeeping
+    cmds                map[state.Id][]state.Command
+    deps                map[state.Id][]state.Id
+    phase               map[state.Id]Phase
+    lb                  *LeaderBookkeeping
+    mutex               *sync.Mutex
+    counter             int32
 }
 
 type Status int
@@ -83,9 +79,9 @@ const (
     preparing Status = iota
     follower
     leader
+    waitingSyncReply
 )
 
-//TODO: Check which are not necessary
 type LeaderBookkeeping struct {
     proposalsById       map[state.Id][]*genericsmr.Propose
     prepareOKs          map[state.Id]int
@@ -93,20 +89,29 @@ type LeaderBookkeeping struct {
     fastAcceptNOKs      map[state.Id]int
     acceptOKs           map[state.Id]int
     acceptNOKs          map[state.Id]int
+    newLeaderOKs        map[int32]int
+    syncOKs             map[int32]int
+    syncNOKs            map[state.Id]int
+    cmds                map[state.Id][]state.Command
+    deps                map[state.Id]map[int32][]state.Id
+    phase               map[state.Id]state.Phase
+    count               map[state.Id]int32
+    maxBallot           int32
 }
 
 
 type channels struct {
     proposeChan         chan *genericsmr.Propose
-    prepareChan         chan fastrpc.Serializable
     acceptChan          chan fastrpc.Serializable
     fastAcceptChan      chan fastrpc.Serializable
     commitChan          chan fastrpc.Serializable
+    newLeaderChan       chan fastrpc.Serializable
     syncChan      chan fastrpc.Serializable
-    prepareReplyChan    chan fastrpc.Serializable
     acceptReplyChan     chan fastrpc.Serializable
     fastAcceptReplyChan chan fastrpc.Serializable
-    syncReplyChan      chan fastrpc.Serializable
+    newLeaderReplyChan       chan fastrpc.Serializable
+    syncReplyChan       chan fastrpc.Serializable
+
 }
 
 type connection struct{
@@ -116,27 +121,28 @@ type connection struct{
 
 func NewReplicaStub(id int, peerAddrList []string, IsLeader bool, thrifty bool, exec bool, lread bool, dreply bool, durable bool, chans *channels, connections map[int32]*connection, control chan bool) *Replica {
     r := &Replica{genericsmr.NewReplica(id, peerAddrList, thrifty, exec, lread, dreply),
-        chans.prepareChan,
         chans.acceptChan,
         chans.fastAcceptChan,
         chans.commitChan,
+        chans.newLeaderChan,
         chans.syncChan,
-        chans.prepareReplyChan,
         chans.acceptReplyChan,
         chans.fastAcceptReplyChan,
+        chans.newLeaderReplyChan,
         chans.syncReplyChan,
-        0, 0, 0,0,0, 0, 0, 0, 0, 0, 0,
+        0, 0, 0,0,0,0,0, 0, 0, 0, 0, 0, 0,
         follower,
         -1,
         -1,
         -1,
         false,
         false,
-        true,
         make(map[state.Id][]state.Command),
         make(map[state.Id][]state.Id),
         make(map[state.Id]Phase),
         nil,
+        new(sync.Mutex),
+        0,
     }
 
 
@@ -144,81 +150,108 @@ func NewReplicaStub(id int, peerAddrList []string, IsLeader bool, thrifty bool, 
     r.ProposeChan = chans.proposeChan
 
     if IsLeader {
-        r.lb = &LeaderBookkeeping{
-            make(map[state.Id][]*genericsmr.Propose),
-            make(map[state.Id]int),
-            make(map[state.Id]int),
-            make(map[state.Id]int),
-            make(map[state.Id]int),
-            make(map[state.Id]int),
-        }
+        r.lb = newLeaderBK()
         r.status = leader
     }
 
-    r.prepareRPC = r.RegisterRPC(new(optgpaxosproto.Prepare), r.prepareChan)
-    r.acceptRPC = r.RegisterRPC(new(optgpaxosproto.Accept), r.acceptChan)
-    r.fastAcceptRPC = r.RegisterRPC(new(optgpaxosproto.FastAccept), r.fastAcceptChan)
-    r.commitRPC = r.RegisterRPC(new(optgpaxosproto.Commit), r.commitChan)
-    r.syncRPC = r.RegisterRPC(new(optgpaxosproto.Sync), r.syncChan)
-    r.prepareReplyRPC = r.RegisterRPC(new(optgpaxosproto.PrepareReply), r.prepareReplyChan)
-    r.acceptReplyRPC = r.RegisterRPC(new(optgpaxosproto.AcceptReply), r.acceptReplyChan)
-    r.fastAcceptReplyRPC = r.RegisterRPC(new(optgpaxosproto.FastAcceptReply), r.fastAcceptReplyChan)
-    r.syncReplyRPC = r.RegisterRPC(new(optgpaxosproto.SyncReply), r.syncReplyChan)
+    r.registerRPCs()
 
     go r.runFake(connections, control)
 
     return r
 }
 
-//func NewReplica(id int, peerAddrList []string, Isleader bool, thrifty bool, exec bool, lread bool, dreply bool, durable bool) *Replica {
-//    r := &Replica{genericsmr.NewReplica(id, peerAddrList, thrifty, exec, lread, dreply),
-//        make(chan fastrpc.Serializable, genericsmr.CHAN_BUFFER_SIZE),
-//        make(chan fastrpc.Serializable, genericsmr.CHAN_BUFFER_SIZE),
-//        make(chan fastrpc.Serializable, genericsmr.CHAN_BUFFER_SIZE),
-//        make(chan fastrpc.Serializable, genericsmr.CHAN_BUFFER_SIZE),
-//        make(chan fastrpc.Serializable, genericsmr.CHAN_BUFFER_SIZE),
-//        make(chan fastrpc.Serializable, genericsmr.CHAN_BUFFER_SIZE),
-//        make(chan fastrpc.Serializable, 3*genericsmr.CHAN_BUFFER_SIZE),
-//        make(chan fastrpc.Serializable, 3*genericsmr.CHAN_BUFFER_SIZE),
-//        0, 0, 0, 0, 0, 0, 0, 0, 0,
-//        false,
-//        make([]*Instance, 15*1024*1024),
-//        0,
-//        -1,
-//        -1,
-//        false,
-//        0,
-//        true,
-//        -1,
-//        false,
-//        -1,
-//    }
-//
-//    r.Durable = durable
-//    r.IsLeader = Isleader
-//
-//    r.prepareRPC = r.RegisterRPC(new(optgpaxosproto.Prepare), r.prepareChan)
-//    r.acceptRPC = r.RegisterRPC(new(optgpaxosproto.Accept), r.acceptChan)
-//    r.fastAcceptRPC = r.RegisterRPC(new(optgpaxosproto.FastAccept), r.fastAcceptChan)
-//    r.commitRPC = r.RegisterRPC(new(optgpaxosproto.Commit), r.commitChan)
-//    r.fullCommitRPC = r.RegisterRPC(new(optgpaxosproto.FullCommit), r.fullCommitChan)
-//    r.prepareReplyRPC = r.RegisterRPC(new(optgpaxosproto.PrepareReply), r.prepareReplyChan)
-//    r.acceptReplyRPC = r.RegisterRPC(new(optgpaxosproto.AcceptReply), r.acceptReplyChan)
-//    r.fastAcceptReplyRPC = r.RegisterRPC(new(optgpaxosproto.FastAcceptReply), r.fastAcceptReplyChan)
-//
-//    go r.run()
-//
-//    return r
-//}
+func NewReplica(id int, peerAddrList []string, isLeader bool, thrifty bool, exec bool, lread bool, dreply bool, durable bool) *Replica {
+    r := &Replica{
+        Replica:             genericsmr.NewReplica(id, peerAddrList, thrifty, exec, lread, dreply),
+        acceptChan:          make(chan fastrpc.Serializable, genericsmr.CHAN_BUFFER_SIZE),
+        fastAcceptChan:      make(chan fastrpc.Serializable, genericsmr.CHAN_BUFFER_SIZE),
+        commitChan:          make(chan fastrpc.Serializable, genericsmr.CHAN_BUFFER_SIZE),
+        newLeaderChan:       make(chan fastrpc.Serializable, genericsmr.CHAN_BUFFER_SIZE),
+        syncChan:            make(chan fastrpc.Serializable, genericsmr.CHAN_BUFFER_SIZE),
+        acceptReplyChan:     make(chan fastrpc.Serializable, genericsmr.CHAN_BUFFER_SIZE),
+        fastAcceptReplyChan: make(chan fastrpc.Serializable, genericsmr.CHAN_BUFFER_SIZE),
+        newLeaderReplyChan:  make(chan fastrpc.Serializable, genericsmr.CHAN_BUFFER_SIZE),
+        syncReplyChan:       make(chan fastrpc.Serializable, genericsmr.CHAN_BUFFER_SIZE),
+        prepareRPC:          0,
+        acceptRPC:           0,
+        fastAcceptRPC:       0,
+        commitRPC:           0,
+        syncRPC:             0,
+        fullCommitRPC:       0,
+        commitShortRPC:      0,
+        prepareReplyRPC:     0,
+        acceptReplyRPC:      0,
+        fastAcceptReplyRPC:  0,
+        syncReplyRPC:        0,
+        newLeaderRPC:        0,
+        newLeaderReplyRPC:   0,
+        status:              follower,
+        maxRecvBallot:       -1,
+        bal:                 -1,
+        cbal:                -1,
+        Shutdown:            false,
+        flush:               false,
+        cmds:                make(map[state.Id][]state.Command),
+        deps:                make(map[state.Id][]state.Id),
+        phase:               make(map[state.Id]Phase),
+        lb:                  nil,
+        mutex:               new(sync.Mutex),
+        counter:             0,
+    }
+
+    r.Durable = durable
+    if isLeader {
+        r.lb = newLeaderBK()
+        r.status = leader
+    }
+
+   r.registerRPCs()
+
+   go r.run()
+
+   return r
+}
+
+func (r *Replica) registerRPCs(){
+    r.acceptRPC             = r.RegisterRPC(new(optgpaxosproto.Accept), r.acceptChan)
+    r.fastAcceptRPC         = r.RegisterRPC(new(optgpaxosproto.FastAccept), r.fastAcceptChan)
+    r.commitRPC             = r.RegisterRPC(new(optgpaxosproto.Commit), r.commitChan)
+    r.newLeaderRPC          = r.RegisterRPC(new(optgpaxosproto.NewLeader), r.newLeaderChan)
+    r.syncRPC               = r.RegisterRPC(new(optgpaxosproto.Sync), r.syncChan)
+    r.acceptReplyRPC        = r.RegisterRPC(new(optgpaxosproto.AcceptReply), r.acceptReplyChan)
+    r.fastAcceptReplyRPC    = r.RegisterRPC(new(optgpaxosproto.FastAcceptReply), r.fastAcceptReplyChan)
+    r.newLeaderReplyRPC     = r.RegisterRPC(new(optgpaxosproto.NewLeaderReply), r.newLeaderReplyChan)
+    r.syncReplyRPC          = r.RegisterRPC(new(optgpaxosproto.SyncReply), r.syncReplyChan)
+}
+
+func newLeaderBK() *LeaderBookkeeping{
+    return &LeaderBookkeeping{
+        make(map[state.Id][]*genericsmr.Propose),
+        make(map[state.Id]int),
+        make(map[state.Id]int),
+        make(map[state.Id]int),
+        make(map[state.Id]int),
+        make(map[state.Id]int),
+        make(map[int32]int),
+        make(map[int32]int),
+        make(map[state.Id]int),
+        make(map[state.Id][]state.Command),
+        make(map[state.Id]map[int32][]state.Id),
+        make(map[state.Id]state.Phase),
+        make(map[state.Id]int32),
+        -1,
+    }
+}
 
 //append a log entry to stable storage
-//TODO: must understand the semantics of the log. Should store deps?
+//TODO: This must be reviewed.
 func (r *Replica) recordInstanceMetadata(id state.Id) {
     if !r.Durable {
         return
     }
     var b [13]byte
-    binary.LittleEndian.PutUint32(b[0:4], uint32(r.currBallot))
+    binary.LittleEndian.PutUint32(b[0:4], uint32(r.bal))
     binary.LittleEndian.PutUint64(b[4:12], uint64(id))
     b[12] = byte(r.phase[id])
     r.StableStore.Write(b[:])
@@ -251,21 +284,15 @@ func (r *Replica) sync() {
 /* RPC to be called by master */
 
 func (r *Replica) BeTheLeader(args *genericsmrproto.BeTheLeaderArgs, reply *genericsmrproto.BeTheLeaderReply) error {
-    r.Mutex.Lock()
-    r.status = leader
-    r.lb = &LeaderBookkeeping{
-        make(map[state.Id][]*genericsmr.Propose),
-        make(map[state.Id]int),
-        make(map[state.Id]int),
-        make(map[state.Id]int),
-        make(map[state.Id]int),
-        make(map[state.Id]int),
-    }
-    r.forceNewBallot = true
+    //r.Mutex.Lock()
+    r.status = preparing
+    r.lb = newLeaderBK()
 
-    log.Println("I am the leader")
+    log.Printf("%d: I am the leader", r.Id)
     time.Sleep(5 * time.Second) // wait that the connection is actually lost
-    r.Mutex.Unlock()
+    //r.Mutex.Unlock()
+
+    r.bcastNewLeader()
     return nil
 }
 
@@ -273,10 +300,6 @@ func (r *Replica) revokeLeader(){
     log.Println("No longer leader")
     r.status = follower
     r.lb = nil
-}
-
-func (r *Replica) replyPrepare(replicaId int32, reply *optgpaxosproto.PrepareReply) {
-    r.SendMsg(replicaId, r.prepareReplyRPC, reply)
 }
 
 func (r *Replica) replyAccept(replicaId int32, reply *optgpaxosproto.AcceptReply) {
@@ -289,6 +312,10 @@ func (r *Replica) replyFastAccept(replicaId int32, reply *optgpaxosproto.FastAcc
 
 func (r *Replica) replySync(replicaId int32, reply *optgpaxosproto.SyncReply) {
     r.SendMsg(replicaId, r.syncReplyRPC, reply)
+}
+
+func (r *Replica) replyNewLeader(replicaId int32, reply *optgpaxosproto.NewLeaderReply) {
+    r.SendMsg(replicaId, r.newLeaderReplyRPC, reply)
 }
 
 
@@ -349,6 +376,7 @@ func (r *Replica) runFake(connections map[int32]*connection, control chan bool) 
 func (r *Replica) messageLoop(control chan bool) {
     onOffProposeChan := r.ProposeChan
     for !r.Shutdown {
+        r.mutex.Lock()
         select {
 
         case <-clockChan:
@@ -358,77 +386,86 @@ func (r *Replica) messageLoop(control chan bool) {
 
         case propose := <-onOffProposeChan:
             //got a Propose from a client
-            dlog.Printf("%d: Received proposal with type=%d\n", r.Id, propose.Command.Op)
+            dlog.Printf("%d: Received Proposal with type=%d\n", r.Id, propose.Command.Op)
             r.handlePropose(propose)
-            //deactivate the new proposals channel to prioritize the handling of protocol messages
             sendControl(control)
+            //deactivate the new proposals channel to prioritize the handling of protocol messages
             onOffProposeChan = nil
             break
 
-        case prepareS := <-r.prepareChan:
-            prepare := prepareS.(*optgpaxosproto.Prepare)
-            //got a Prepare message
-            dlog.Printf("%d: Received Prepare from replica %d, with ballot %d\n", r.Id, prepare.Ballot)
-            r.handlePrepare(prepare)
-            sendControl(control)
-            break
-
-        case acceptS := <-r.acceptChan:
-            accept := acceptS.(*optgpaxosproto.Accept)
+        case acceptC := <-r.acceptChan:
+            accept := acceptC.(*optgpaxosproto.Accept)
             //got an Accept message
             dlog.Printf("%d: Received Accept from replica %d, for ballot %d with id %d\n", r.Id, accept.LeaderId, accept.Ballot, accept.Id)
             r.handleAccept(accept)
             sendControl(control)
             break
 
-        case fastAcceptS := <-r.fastAcceptChan:
-            fastAccept := fastAcceptS.(*optgpaxosproto.FastAccept)
+        case fastAcceptC := <-r.fastAcceptChan:
+            fastAccept := fastAcceptC.(*optgpaxosproto.FastAccept)
             //got an Accept message
-            dlog.Printf("%d: Received Fast Accept from replica %d, for ballot %d with id %d\n", r.Id, fastAccept.LeaderId, fastAccept.Ballot, fastAccept.Id)
+            dlog.Printf("%d: Received FastAccept from replica %d, for ballot %d with id %d\n", r.Id, fastAccept.LeaderId, fastAccept.Ballot, fastAccept.Id)
             r.handleFastAccept(fastAccept)
             sendControl(control)
             break
 
-        case commitS := <-r.commitChan:
-            commit := commitS.(*optgpaxosproto.Commit)
+        case commitC := <-r.commitChan:
+            commit := commitC.(*optgpaxosproto.Commit)
             //got a Commit message
             dlog.Printf("%d: Received Commit from replica %d, with id %d\n", r.Id, commit.LeaderId, commit.Id)
             r.handleCommit(commit)
             sendControl(control)
             break
 
-        case syncS := <-r.syncChan:
-            sync := syncS.(*optgpaxosproto.Sync)
-            dlog.Printf("%d: Received Full Commit from replica %d, for ballot %d\n", r.Id, sync.LeaderId, sync.Ballot)
+        case newLeaderC := <-r.newLeaderChan:
+            newLeader := newLeaderC.(*optgpaxosproto.NewLeader)
+            //got a Commit message
+            dlog.Printf("%d: Received NewLeader from replica %d, with ballot %d\n", r.Id, newLeader.LeaderId, newLeader.Ballot)
+            r.handleNewLeader(newLeader)
+            sendControl(control)
+            break
+
+        case syncC := <-r.syncChan:
+            sync := syncC.(*optgpaxosproto.Sync)
+            dlog.Printf("%d: Received Sync from replica %d, for ballot %d\n", r.Id, sync.LeaderId, sync.Ballot)
             r.handleSync(sync)
             sendControl(control)
             break
 
-        case prepareReplyS := <-r.prepareReplyChan:
-            prepareReply := prepareReplyS.(*optgpaxosproto.PrepareReply)
-            //got a Prepare reply
-            dlog.Printf("%d: Received PrepareReply for ballot %d\n", r.Id, prepareReply.Ballot)
-            r.handlePrepareReply(prepareReply)
-            sendControl(control)
-            break
-
-        case acceptReplyS := <-r.acceptReplyChan:
-            acceptReply := acceptReplyS.(*optgpaxosproto.AcceptReply)
+        case acceptReplyC := <-r.acceptReplyChan:
+            acceptReply := acceptReplyC.(*optgpaxosproto.AcceptReply)
             //got an Accept reply
             dlog.Printf("%d: Received AcceptReply for ballot %d\n", r.Id, acceptReply.Ballot)
             r.handleAcceptReply(acceptReply)
             sendControl(control)
             break
 
-        case fastAcceptReplyS := <-r.fastAcceptReplyChan:
-            fastAcceptReply := fastAcceptReplyS.(*optgpaxosproto.FastAcceptReply)
+        case fastAcceptReplyC := <-r.fastAcceptReplyChan:
+            fastAcceptReply := fastAcceptReplyC.(*optgpaxosproto.FastAcceptReply)
             //got an Accept reply
             dlog.Printf("%d: Received FastAcceptReply for ballot %d\n", r.Id, fastAcceptReply.Ballot)
             r.handleFastAcceptReply(fastAcceptReply)
             sendControl(control)
             break
-        }
 
+        case newLeaderReplyC := <-r.newLeaderReplyChan:
+            newLeaderReply := newLeaderReplyC.(*optgpaxosproto.NewLeaderReply)
+            //got a Commit message
+            dlog.Printf("%d: Received NewLeaderReply for leader %d with ballot %d\n", r.Id, newLeaderReply.LeaderId, newLeaderReply.Ballot)
+            r.handleNewLeaderReply(newLeaderReply)
+            sendControl(control)
+            break
+
+        case syncReplyC := <-r.syncReplyChan:
+            syncReply := syncReplyC.(*optgpaxosproto.SyncReply)
+            //got a Prepare reply
+            dlog.Printf("%d: Received SyncReply for ballot %d\n", r.Id, syncReply.Ballot)
+            r.handleSyncReply(syncReply)
+            sendControl(control)
+            break
+
+        }
+        r.mutex.Unlock()
     }
 }
 
@@ -439,32 +476,19 @@ func sendControl(control chan bool){
     }
 }
 
-func (r *Replica) makeBallot(instance int32) int32 {
-    ret := r.Id
-
-    if r.defaultBallot > ret {
-        ret = r.defaultBallot + 1
+func (r *Replica) makeBallot(forceNew bool) int32 {
+    //log.Printf("Make Ballot orig: %d", r.bal)
+    if r.bal == -1 {
+        r.bal = r.Id
     }
 
-    if r.maxRecvBallot > ret {
-        ret = r.maxRecvBallot + 1
-    }
-
-    return ret
-}
-
-func (r *Replica) makeBallot2(forceNew bool) int32 {
-    if r.currBallot == -1 {
-        r.currBallot = r.Id
-    }
-
-    if r.maxRecvBallot > r.currBallot {
-        r.currBallot = r.maxRecvBallot + 1
+    if r.maxRecvBallot > r.bal {
+        r.bal = r.maxRecvBallot + 1
     } else if forceNew{
-        r.currBallot++
+        r.bal++
     }
-
-    return r.currBallot
+    //log.Printf("Make Ballot ret: %d", r.bal)
+    return r.bal
 }
 
 //func (r *Replica) updateCommittedUpTo() {
@@ -479,7 +503,7 @@ func (r *Replica) makeBallot2(forceNew bool) int32 {
 
 
 // Gets dependencies from previous instances and current instance.
-//TODO: Splitting commands over multiple instances reduces the cost of this step.
+//Splitting commands over multiple paxos instances could reduces the cost of this step.
 func (r *Replica) getDeps(cmd state.Command) []state.Id {
     deps := make([]state.Id, 0)
     for id, other := range r.cmds {
@@ -490,7 +514,7 @@ func (r *Replica) getDeps(cmd state.Command) []state.Id {
     return deps
 }
 
-func (r *Replica) checkDependenciesDelived(id state.Id, instNo int32) bool {
+func (r *Replica) checkDependenciesDelivered(id state.Id, instNo int32) bool {
     ret := true
     var failed string
     for _, deps := range r.deps {
@@ -511,6 +535,31 @@ func (r *Replica) checkDependenciesDelived(id state.Id, instNo int32) bool {
 }
 
 
+//TODO store dependencies ordered to improve performance
+func depsEqual(first, second []state.Id) bool{
+    allEqual := true
+    if len(first) != len(second) {
+        allEqual = false
+    } else {
+        for _, depi := range first {
+            found := false;
+            for _, depj := range second {
+                if depi == depj {
+                    found = true
+                    break;
+                }
+            }
+
+            if !found{
+                allEqual = false
+                break
+            }
+        }
+    }
+    return allEqual
+}
+
+//TODO: Please review this
 func isConflicting(cmd state.Command, otherCmds []state.Command) bool {
     for _, other := range otherCmds {
         if cmd.K == other.K && (cmd.Op == state.PUT || other.Op == state.PUT) {
@@ -520,20 +569,20 @@ func isConflicting(cmd state.Command, otherCmds []state.Command) bool {
     return false
 }
 
-func (r *Replica) getFullCommands() *state.FullCmds {
+func getFullCommands(cmds map[state.Id][]state.Command,deps map[state.Id][]state.Id, phase map[state.Id]Phase) *state.FullCmds {
     fullCmds := &state.FullCmds{
-        Id: make([]state.Id, len(r.cmds)),
-        C:  make([][]state.Command, len(r.cmds)),
-        D:  make([][]state.Id, len(r.cmds)),
-        P:  make([]state.Phase, len(r.cmds)),
+        Id: make([]state.Id, len(cmds)),
+        C:  make([][]state.Command, len(cmds)),
+        D:  make([][]state.Id, len(cmds)),
+        P:  make([]state.Phase, len(cmds)),
     }
 
     i := 0
-    for id, cmd := range r.cmds{
+    for id, cmd := range cmds{
         fullCmds.Id[i] = id
         fullCmds.C[i] = cmd
-        fullCmds.D[i] = r.deps[id]
-        fullCmds.P[i] = state.Phase(r.phase[id])
+        fullCmds.D[i] = deps[id]
+        fullCmds.P[i] = state.Phase(phase[id])
         i++
     }
 
@@ -553,32 +602,6 @@ func (r *Replica) getSeparateCommands(fullCmds *state.FullCmds) (map[state.Id][]
 
     return C, D, P
 }
-
-//func newInstance(createLb bool) *Instance{
-//    var lb *LeaderBookkeeping
-//
-//    if(createLb){
-//        lb = &LeaderBookkeeping{
-//            make(map[state.Id][]*genericsmr.Propose),
-//            0,
-//            make(map[state.Id]int),
-//            make(map[state.Id]int),
-//            0,
-//            0,
-//        }
-//    }
-//
-//    inst := &Instance{
-//        make(map[state.Id][]state.Command),
-//        make(map[state.Id][]state.Id),
-//        -1,
-//        make(map[state.Id]Phase),
-//        -1,
-//        lb,
-//
-//    }
-//    return inst
-//}
 
 func (r *Replica) bcast(quorum int, channel uint8, msg fastrpc.Serializable) {
     defer func() {
@@ -602,70 +625,169 @@ func (r *Replica) bcast(quorum int, channel uint8, msg fastrpc.Serializable) {
 
 }
 
-func (r *Replica) bcastPrepare(ballot int32, toInfinity bool) {
-    dlog.Printf("Send 1A message")
-    ti := FALSE
-    if toInfinity {
-        ti = TRUE
-    }
-    args := &optgpaxosproto.Prepare{LeaderId: r.Id, Ballot: ballot, ToInfinity: ti}
-
-    n := r.N
-    if r.Thrifty {
-        n = int(math.Ceil(float64(n)/2))
-    }
-
-    r.bcast(n, r.prepareRPC, args)
-
-}
-
 func (r *Replica) bcastFastAccept(ballot int32, id state.Id, cmd []state.Command) {
-    dlog.Printf("Send 2A Fast message")
     args := &optgpaxosproto.FastAccept{ LeaderId: r.Id, Ballot: ballot, Id: id, Cmd: cmd}
 
     n := r.N
     if r.Thrifty {
-        n = int(math.Ceil(3*float64(n)/4))-1
+        n = int(math.Ceil(3*float64(n)/4))
     }
 
-    r.bcast(n, r.fastAcceptRPC, args)
+    r.bcast(n-1, r.fastAcceptRPC, args)
 }
 
 
 func (r *Replica) bcastAccept(ballot int32, id state.Id, cmd []state.Command, deps []state.Id) {
-    dlog.Printf("Send 2A message")
-
     args := &optgpaxosproto.Accept{LeaderId: r.Id, Ballot: ballot, Id: id, Cmd: cmd, Dep: deps}
 
     n := r.N
     if r.Thrifty {
         n = int(math.Ceil(float64(n)/2))
     }
-    r.bcast(n, r.acceptRPC, args)
+    r.bcast(n-1, r.acceptRPC, args)
 }
 
 func (r *Replica) bcastCommit(ballot int32, id state.Id, cmd []state.Command, deps []state.Id) {
-    defer func() {
-        if err := recover(); err != nil {
-            log.Println("Commit bcast failed:", err)
-        }
-    }()
-
     args := &optgpaxosproto.Commit{LeaderId: r.Id, Id: id, Cmd: cmd, Deps: deps}
 
-    r.bcast(r.N-1, r.commitRPC, args)
+    n := r.N
+    //if r.Thrifty {
+    //    n = int(math.Ceil(float64(n)/2))
+    //}
+
+    r.bcast(n-1, r.commitRPC, args)
 
 }
 
-func (r *Replica) bcastSync(ballot int32) {
-    defer func() {
-        if err := recover(); err != nil {
-            log.Println("Commit bcast failed:", err)
-        }
-    }()
-    args := &optgpaxosproto.Sync{LeaderId: r.Id, Ballot: ballot, Cmds: *r.getFullCommands()}
+func (r *Replica) bcastNewLeader() {
+    args := &optgpaxosproto.NewLeader{r.Id, r.makeBallot(true)}
 
-    r.bcast(r.N-1, r.fullCommitRPC, args)
+    n := r.N
+
+    r.bcast(n-1, r.fastAcceptRPC, args)
+}
+
+func (r *Replica) bcastSync(ballot int32) {
+    args := &optgpaxosproto.Sync{LeaderId: r.Id, Ballot: ballot, Cmds: *getFullCommands(r.cmds, r.deps, r.phase)}
+
+    n := r.N
+    //TODO: How many msgs are necessary?
+    //if r.Thrifty {
+    //    n = int(math.Ceil(float64(n)/2))
+    //}
+
+    r.bcast(n-1, r.newLeaderReplyRPC, args)
+}
+
+
+func (r *Replica) handleNewLeader(newLeader *optgpaxosproto.NewLeader){
+    if(r.bal >= newLeader.Ballot ){
+        return
+    }
+
+    r.maxRecvBallot = max(newLeader.Ballot, r.maxRecvBallot)
+
+    r.status = preparing
+    r.bal = newLeader.Ballot
+
+    nlreply := &optgpaxosproto.NewLeaderReply{newLeader.LeaderId, r.Id, newLeader.Ballot, r.cbal, *getFullCommands(r.cmds, r.deps, r.phase)}
+    r.replyNewLeader(newLeader.LeaderId, nlreply)
+
+}
+
+func (r *Replica) handleNewLeaderReply(nlReply *optgpaxosproto.NewLeaderReply){
+    if(r.status != preparing || r.bal != nlReply.Ballot ){
+        return
+    }
+
+    r.lb.newLeaderOKs[r.bal]++
+
+    C,D,P := r.getSeparateCommands(&nlReply.Cmds)
+
+    if(nlReply.CBallot > r.lb.maxBallot){
+        r.lb.cmds = make(map[state.Id][]state.Command)
+        r.lb.deps = make(map[state.Id]map[int32][]state.Id)
+        r.lb.phase = make(map[state.Id]state.Phase)
+        r.lb.maxBallot = nlReply.CBallot
+    }
+
+    if(nlReply.CBallot == r.lb.maxBallot ){
+        for id, c := range C {
+            r.lb.cmds[id] = c
+            r.lb.deps[id][nlReply.ReplicaId] = D[id]
+            if state.Phase(P[id]) > r.lb.phase[id]{
+                r.lb.phase[id] = state.Phase(P[id])
+            }
+        }
+    }
+
+    if r.lb.newLeaderOKs[r.bal] > int(math.Ceil(1*float64(r.N)/2))-1 {
+        log.Printf("Sync STATE")
+
+        //change state to avoid late messagess
+        r.status = waitingSyncReply
+        r.lb.syncOKs[r.bal]++
+        r.syncState()
+        r.bcastSync(r.bal)
+    }
+
+}
+
+func (r *Replica) syncState(){
+    syncCmds := make(map[state.Id][]state.Command)
+    syncDeps := make(map[state.Id][]state.Id)
+    syncPhase := make(map[state.Id]Phase)
+
+    //Add committed to bookKeeping
+    for id, c := range r.cmds{
+        if(r.phase[id] == committed){
+            syncCmds[id] = c
+            syncDeps[id] = r.deps[id]
+            syncPhase[id] = r.phase[id]
+        }
+    }
+
+    for id, c := range r.lb.cmds{
+        if(r.lb.phase[id] == state.Phase(slowAcceptMode) && syncPhase[id] != committed){
+            syncCmds[id] = c
+            syncDeps[id] = r.deps[id]
+            syncPhase[id] = r.phase[id]
+        } else{
+            //optimize
+            for _, d := range r.lb.deps[id]{
+                count := 0
+                for _, oD := range r.lb.deps[id]{
+                    equal := depsEqual(d, oD)
+                    if equal{
+                        count++
+                    }
+                    if (count > int(math.Ceil(1*float64(r.N)/4))){
+                        syncCmds[id] = c
+                        syncDeps[id] = d
+                        syncPhase[id] = slowAcceptMode
+                        break
+                    }
+                }
+            }
+        }
+    }
+
+    for _, deps := range syncDeps {
+        for _, d := range deps{
+            if(syncPhase[d] == start){
+                syncCmds[d] = state.NOOP()
+                syncPhase[d] = slowAcceptMode
+            }
+        }
+    }
+
+    r.cmds = syncCmds
+    r.deps = syncDeps
+    r.phase = syncPhase
+
+    r.lb.cmds = nil
+    r.lb.deps = nil
+    r.lb.phase = nil
 }
 
 func (r *Replica) handlePropose(propose *genericsmr.Propose) {
@@ -686,18 +808,22 @@ func (r *Replica) handlePropose(propose *genericsmr.Propose) {
 
     dlog.Printf("Batched %d", batchSize)
 
-    id := state.Id(propose.CommandId)
+    //TODO: propose.CommandId is not unique. Using seq id (non-idempotent).
+    //id := state.Id(propose.CommandId)
+    id := state.Id(r.counter)
+    r.counter++
+    dlog.Printf("ID for command: %d for command %+v", id, propose.Command)
 
+    //Replies with NOK if command ID is repeated
     if(r.phase[id] != start){
-        if(r.lb.proposalsById[id] != nil){
-            for _, p := range r.lb.proposalsById[id] {
-                r.deliverCommand(p, FALSE, state.NIL())
-                r.lb.proposalsById[id] = nil // hack to ensure reply only once
-            }
-        }
-        return
+       dlog.Printf("REPEATED ID")
+       if(r.lb.proposalsById[id] != nil){
+           for _, p := range r.lb.proposalsById[id] {
+               r.deliverCommand(p, FALSE, state.NIL())
+           }
+       }
+       return
     }
-    dlog.Printf("ID for command: %d", id)
 
     cmds := make([]state.Command, batchSize)
     proposals := make([]*genericsmr.Propose, batchSize)
@@ -710,61 +836,35 @@ func (r *Replica) handlePropose(propose *genericsmr.Propose) {
         proposals[i] = prop
     }
 
-    currBallot := r.currBallot
-    ballot := r.makeBallot2(r.forceNewBallot)
-    r.forceNewBallot = false
+    ballot := r.makeBallot(false)
 
-    r.cmds[id] = cmds
     r.lb.proposalsById[id] = proposals
 
-    //TODO: I don't think this works if multiple nodes think they are leaders.
-    if r.currBallot != ballot && currBallot != -1 {
-        dlog.Printf("Classic round for cmd id: %d, with ballot %d\n", id, ballot)
-        r.phase[id] = slowAcceptMode
-        r.bcastPrepare(ballot, true)
-    } else {
-        dlog.Printf("Fast round for cmd id: %d, with ballot %d\n", id, ballot)
-        var deps []state.Id
-        for _, cmd := range cmds {
-            deps = append(deps, r.getDeps(cmd)...)
-        }
-        r.deps[id] = deps
-        r.phase[id] = fastAcceptMode
-        r.lb.fastAcceptOKs[id] = 1
-        r.lb.fastAcceptNOKs[id] = 0
-        r.lb.acceptOKs[id] = 0
-        r.lb.acceptNOKs[id] = 0
+    dlog.Printf("Fast round for cmd id: %d, with ballot %d\n", id, ballot)
 
-        r.recordInstanceMetadata(id)
-        r.recordCommands(r.cmds[id])
-        r.sync()
-
-        r.bcastFastAccept(ballot, id, cmds)
+    // Leader fast accept -- This code can be same function that the acceptor execute + leaderBookKeeping
+    // Code simplification could be applied to all methods
+    var deps []state.Id
+    for _, cmd := range cmds {
+        deps = append(deps, r.getDeps(cmd)...)
     }
-}
+    r.phase[id] = fastAcceptMode
+    r.cmds[id] = cmds
+    r.deps[id] = deps
 
-func (r *Replica) handlePrepare(prepare *optgpaxosproto.Prepare) {
-    var preply *optgpaxosproto.PrepareReply
+    r.lb.fastAcceptOKs[id] = 1
+    r.lb.fastAcceptNOKs[id] = 0
+    r.lb.acceptOKs[id] = 0
+    r.lb.acceptNOKs[id] = 0
 
-    r.maxRecvBallot = max(prepare.Ballot, r.maxRecvBallot)
 
-    if prepare.Ballot > r.currBallot {
-        preply = &optgpaxosproto.PrepareReply{Ballot: prepare.Ballot, OK: TRUE, Cmds: *r.getFullCommands()}
-        r.currBallot = prepare.Ballot
-        r.status = preparing
+    //TODO: DID NOT CHECK WHEN TO RECORD TO DISK. Must also review method implementation.
+    r.recordInstanceMetadata(id)
+    r.recordCommands(r.cmds[id])
+    r.sync()
 
-    } else {
-        dlog.Printf("Lower than default! %d < %d", prepare.Ballot, r.defaultBallot)
-        preply = &optgpaxosproto.PrepareReply{Ballot: r.defaultBallot, OK: FALSE, Cmds: state.FullCmds{}}
-    }
+    r.bcastFastAccept(ballot, id, cmds)
 
-    //Ignore message if NOK?
-    r.replyPrepare(prepare.LeaderId, preply)
-
-    //TODO: what does ToInfinity do?
-    /*if prepare.ToInfinity == TRUE && prepare.Ballot > r.defaultBallot {
-        r.defaultBallot = prepare.Ballot
-    }*/
 }
 
 func (r *Replica) handleFastAccept(fastAccept *optgpaxosproto.FastAccept) {
@@ -775,28 +875,24 @@ func (r *Replica) handleFastAccept(fastAccept *optgpaxosproto.FastAccept) {
     var fareply *optgpaxosproto.FastAcceptReply
     r.maxRecvBallot = max(fastAccept.Ballot, r.maxRecvBallot)
     id := fastAccept.Id
-    if fastAccept.Ballot < r.currBallot{
-        fareply = &optgpaxosproto.FastAcceptReply{Ballot: r.currBallot, OK: FALSE, Id: fastAccept.Id}
+
+    if fastAccept.Ballot < r.bal{
+        fareply = &optgpaxosproto.FastAcceptReply{Ballot: r.bal, OK: FALSE, Id: fastAccept.Id}
     } else {
-        // FAST FORWARD if fastAccept.ballot > r.currBallot. Should we handle it differently?
+        // FAST FORWARD if fastAccept.ballot > r.currBallot. Should handle it differently?
         if r.phase[id] == start {
             var deps []state.Id
             for _, cmd := range fastAccept.Cmd {
                 deps = append(deps, r.getDeps(cmd)...)
             }
+            r.phase[id] = fastAcceptMode
             r.cmds[id] = fastAccept.Cmd
             r.deps[id] = deps
-            r.phase[id] = fastAcceptMode
-            r.currBallot = fastAccept.Ballot
-            fareply = &optgpaxosproto.FastAcceptReply{Ballot: r.currBallot, OK: TRUE, Id: id, Cmd: r.cmds[id], Deps: r.deps[id]}
+            r.bal = fastAccept.Ballot
+            fareply = &optgpaxosproto.FastAcceptReply{Ballot: r.bal, OK: TRUE, Id: id, Cmd: r.cmds[id], Deps: r.deps[id]}
         } else {
-            dlog.Printf("Current instance has already started.")
-            //if r.phase[id] == FAST_ACCEPT{
-            //    dlog.Printf("Reply already sent. Replying again.")
-            //    areply = &optgpaxosproto.FastAcceptReply{TRUE, r.currBallot, id, deps}
-            //    //It seems that the code does not check repeated responses, so it should not.
-            //}
-            fareply = &optgpaxosproto.FastAcceptReply{Ballot: r.currBallot, OK: FALSE, Id: id, Deps: nil}
+            dlog.Printf("Id has already started.")
+            fareply = &optgpaxosproto.FastAcceptReply{Ballot: r.bal, OK: FALSE, Id: id, Deps: nil}
         }
 
     }
@@ -807,7 +903,15 @@ func (r *Replica) handleFastAccept(fastAccept *optgpaxosproto.FastAccept) {
         r.sync()
     }
 
-    dlog.Printf("%d Response for %d :  %d, %+v", r.Id, fastAccept.Id, fareply.OK, fareply.Deps)
+    //FAKE REORDER --- FOR TESTING
+    //if fareply.Id == 5 && r.status == follower && (r.Id == 1 || r.Id == 2 || r.Id == 3 || r.Id == 4 || r.Id == 5) {
+    //    dlog.Printf("FAKE REORDER OF MESSAGES")
+    //    tmpDeps := make([]state.Id, len(fareply.Deps)-1)
+    //    tmpDeps =  fareply.Deps[:(len(fareply.Deps) - 1)]
+    //    fareply.Deps = tmpDeps
+    //}
+
+    //dlog.Printf("%d Response for %d :  %d, %+v", r.Id, fastAccept.Id, fareply.OK, fareply.Deps)
     r.replyFastAccept(fastAccept.LeaderId, fareply)
 }
 
@@ -820,16 +924,16 @@ func (r *Replica) handleAccept(accept *optgpaxosproto.Accept) {
     r.maxRecvBallot = max(accept.Ballot, r.maxRecvBallot)
     id := accept.Id
 
-    if accept.Ballot < r.currBallot{
-        areply = &optgpaxosproto.AcceptReply{Ballot: r.currBallot, OK: FALSE, Id: accept.Id}
+    if accept.Ballot < r.bal{
+        areply = &optgpaxosproto.AcceptReply{Ballot: r.bal, OK: FALSE, Id: accept.Id}
     } else {
         // FAST FORWARD if fastAccept.ballot > r.currBallot. Should we handle it differently?
         var deps []state.Id
         r.cmds[id] = accept.Cmd
         r.deps[id] = deps
         r.phase[id] = slowAcceptMode
-        r.currBallot = accept.Ballot
-        areply = &optgpaxosproto.AcceptReply{Ballot: r.currBallot, OK: TRUE, Id: id, Cmd: r.cmds[id], Dep: r.deps[id]}
+        r.bal = accept.Ballot
+        areply = &optgpaxosproto.AcceptReply{Ballot: r.bal, OK: TRUE, Id: id, Cmd: r.cmds[id], Dep: r.deps[id]}
 
 
     }
@@ -838,12 +942,10 @@ func (r *Replica) handleAccept(accept *optgpaxosproto.Accept) {
         r.recordInstanceMetadata(id)
         r.recordCommands(accept.Cmd)
         r.sync()
+        r.replyAccept(accept.LeaderId, areply)
     }
 
-    //Reply even if NOK
-    dlog.Printf("%d Response for %d :  %d", r.Id, accept.Id, areply.OK)
-    r.replyAccept(accept.LeaderId, areply)
-
+    //Not replying if NOK
 }
 
 func (r *Replica) handleCommit(commit *optgpaxosproto.Commit) {
@@ -855,8 +957,6 @@ func (r *Replica) handleCommit(commit *optgpaxosproto.Commit) {
     r.recordInstanceMetadata(id)
     r.recordCommands(r.cmds[id])
 
-    dlog.Printf("Pending Commands %d", len(r.ProposeChan))
-
 }
 
 func (r *Replica) handleSync(sync *optgpaxosproto.Sync) {
@@ -864,7 +964,10 @@ func (r *Replica) handleSync(sync *optgpaxosproto.Sync) {
     C,D,P := r.getSeparateCommands(&sync.Cmds)
     r.maxRecvBallot = max(sync.Ballot, r.maxRecvBallot)
 
-    if sync.Ballot > r.currBallot{
+    if sync.Ballot == r.bal{
+        r.status = follower
+        r.bal = sync.Ballot
+        r.cbal = sync.Ballot
         r.cmds = C
         r.deps = D
         r.phase = P
@@ -874,26 +977,49 @@ func (r *Replica) handleSync(sync *optgpaxosproto.Sync) {
             r.recordCommands(r.cmds[id])
         }
 
-        sreply := &optgpaxosproto.SyncReply{LeaderId: sync.LeaderId, OK: FALSE, Ballot: r.currBallot}
+        //TODO: OK parameter is not necessary
+        sreply := &optgpaxosproto.SyncReply{LeaderId: sync.LeaderId, OK: TRUE, Ballot: r.bal}
         r.replySync(sync.LeaderId, sreply)
     } else{
 
     }
 }
 
-func (r *Replica) handlePrepareReply(preply *optgpaxosproto.PrepareReply) {
+func (r *Replica) handleSyncReply(sreply *optgpaxosproto.SyncReply) {
 
-    r.maxRecvBallot = max(preply.Ballot, r.maxRecvBallot)
+    r.maxRecvBallot = max(sreply.Ballot, r.maxRecvBallot)
 
-    if r.status != preparing  || preply.Ballot != r.currBallot {
+    if r.status != waitingSyncReply  || sreply.Ballot != r.bal {
         // TODO: should replies for non-current ballots be ignored?
         // we've moved on -- these are delayed replies, so just ignore
         dlog.Printf("Ignoring instances not in PREPARING stage")
         return
     }
 
+    if sreply.OK == TRUE {
+        r.lb.syncOKs[r.bal]++
 
-    //TODO: Recovery not implemented.
+        if r.lb.syncOKs[r.bal] > int(math.Ceil(1*float64(r.N)/2))-1 {
+            dlog.Printf("%d: I am the elected leader", r.Id)
+            r.status = leader
+            for id, _ := range r.phase{
+                if(r.phase[id] != committed){
+                    r.phase[id] = committed
+                    r.bcastCommit(r.bal, id, r.cmds[id], r.deps[id])
+                }
+            }
+
+        }
+    } else {
+        if(r.maxRecvBallot > r.bal){
+            dlog.Printf("There is another active leader ( %d > %d)", r.maxRecvBallot, r.bal, ")")
+            //TODO: Must test leader change.
+            if(r.status == leader){
+                r.revokeLeader()
+            }
+        }
+    }
+
 }
 
 func (r *Replica) handleFastAcceptReply(areply *optgpaxosproto.FastAcceptReply) {
@@ -910,56 +1036,40 @@ func (r *Replica) handleFastAcceptReply(areply *optgpaxosproto.FastAcceptReply) 
         // we've move on, these are delayed replies, so just ignore
     }
 
-    if areply.OK == TRUE && r.currBallot == areply.Ballot {
-        allEqual := true
-        if len(r.deps[id]) != len(areply.Deps){
-            allEqual = false
-        } else {
-            for _, depi := range areply.Deps {
-                allEqual = false;
-                for _, depj := range areply.Deps {
-                    if depi == depj {
-                        allEqual = true
-                        break;
-                    }
-                }
-                if !allEqual{
-                    dlog.Printf("Dep check NOK for id %+v: %v != %+v", id, r.deps[id], areply.Deps)
-                    break
-                }
-            }
+    if areply.OK == TRUE && r.bal == areply.Ballot {
+        allEqual := depsEqual(r.deps[id], areply.Deps)
 
-        }
         if allEqual {
             r.lb.fastAcceptOKs[id]++
-            dlog.Printf("Min OKs > %d, got: %d", int(math.Ceil(3*float64(r.N)/4))-1, r.lb.fastAcceptOKs[id])
+            //dlog.Printf("Min OKs > %d, got: %d", int(math.Ceil(3*float64(r.N)/4))-1, r.lb.fastAcceptOKs[id])
 
         } else{
             r.lb.fastAcceptNOKs[id]++
-            dlog.Printf("Max NOKs : %d, got: %d", int(math.Ceil(1*float64(r.N)/4))-1, r.lb.fastAcceptNOKs[id])
+            //dlog.Printf("Max NOKs : %d, got: %d", int(math.Ceil(1*float64(r.N)/4))-1, r.lb.fastAcceptNOKs[id])
         }
         if r.lb.fastAcceptOKs[id] > int(math.Ceil(3*float64(r.N)/4))-1 {
             r.phase[id] = committed
-            r.bcastCommit(r.currBallot, id, r.cmds[id], r.deps[id])
+            r.bcastCommit(r.bal, id, r.cmds[id], r.deps[id])
 
-            if r.lb.proposalsById[id] != nil{
+            //TODO: I am not sure if the code for executing the command immediately is correct.
+            if r.lb.proposalsById[id] != nil && !r.Dreply {
                 r.tryToDeliverOrExecute(!r.Dreply, false)
             }
 
             r.recordInstanceMetadata(id)
             r.sync() //is this necessary?
         } else if r.lb.fastAcceptNOKs[areply.Id] > int(math.Ceil(1*float64(r.N)/4)-1){
-            dlog.Printf("Collision recovery")
+            dlog.Printf("Collision recovery: set deps for %d: %+v",areply.Id, r.deps[areply.Id])
             r.phase[id] = slowAcceptMode
             r.lb.acceptOKs[id] = 1
             r.lb.acceptNOKs[id] = 0
             r.recordInstanceMetadata(id)
             r.sync()
-            r.bcastAccept(r.currBallot, id, r.cmds[id], r.deps[id])
+            r.bcastAccept(r.bal, id, r.cmds[id], r.deps[id])
         }
     } else {
-        if(r.maxRecvBallot > r.currBallot){
-            dlog.Printf("There is another active leader ( %d > %d)", r.maxRecvBallot, r.currBallot, ")")
+        if(r.maxRecvBallot > r.bal){
+            dlog.Printf("There is another active leader ( %d > %d)", r.maxRecvBallot, r.bal, ")")
             //TODO: Must test leader change.
             if(r.status == leader){
                 r.revokeLeader()
@@ -983,14 +1093,15 @@ func (r *Replica) handleAcceptReply(areply *optgpaxosproto.AcceptReply) {
         return;
     }
 
-    if areply.OK == TRUE && r.currBallot == areply.Ballot {
+    if areply.OK == TRUE && r.bal == areply.Ballot {
         r.lb.acceptOKs[id]++
         //TODO: What is the size of this quorum?
         if r.lb.acceptOKs[id] > r.N>>1 {
+            dlog.Printf("Moved to commit after Recovery")
             r.phase[id] = committed
-            r.bcastCommit(r.currBallot, id, r.cmds[id], r.deps[id])
+            r.bcastCommit(r.bal, id, r.cmds[id], r.deps[id])
 
-            if r.lb.proposalsById[id] != nil{
+            if r.lb.proposalsById[id] != nil && !r.Dreply {
                 r.tryToDeliverOrExecute(!r.Dreply, false)
             }
 
@@ -1006,18 +1117,21 @@ func (r *Replica) handleAcceptReply(areply *optgpaxosproto.AcceptReply) {
 
 func (r *Replica) executeCommands() {
     for !r.Shutdown {
-        executed := r.tryToDeliverOrExecute(r.Dreply && r.status == leader, true)
-
-        if !executed { // I think it can sleep everytime, becuase method delivers all possible
+        r.mutex.Lock()
+        r.dumpDeliveryState()
+        /*executed := */r.tryToDeliverOrExecute(r.Dreply && r.status == leader, true)
+        r.mutex.Unlock()
+        //Delivers all possible, so sleep everytime
+        //if !executed {
             time.Sleep(1* time.Second)
-        }
+        //}
 
     }
 
 }
 
 func (r *Replica) tryToDeliverOrExecute(deliver bool, execute bool) bool{
-    //TODO: Cache undelivered for faster retries
+    //TODO: IMPORTANT: Very unefficient code.
     anyDelivered := true
     atLeastOne := false
     for anyDelivered {
@@ -1031,15 +1145,21 @@ func (r *Replica) tryToDeliverOrExecute(deliver bool, execute bool) bool{
                         break
                     }
                 }
+
                 if allDepsDelivered {
                     r.phase[id] = forDelivery
-                    if deliver || execute{
+                    if !deliver && r.status != leader{
+                        r.phase[id] = delivered
+                    }
+                    if deliver || execute {
                         for i, c := range r.cmds[id]{
                             val := state.NIL()
                             if execute {
+                                //dlog.Printf("Trying to execute command with id %d", id)
                                 val = c.Execute(r.State)
                             }
                             if deliver {
+                                //dlog.Printf("Trying to deliver command with id %d", id)
                                 r.deliverCommand(r.lb.proposalsById[id][i], TRUE, val)
                                 r.phase[id] = delivered
                             }
@@ -1063,8 +1183,40 @@ func (r *Replica) deliverCommand(p *genericsmr.Propose, ok uint8, val state.Valu
             Timestamp: p.Timestamp}
         r.ReplyProposeTS(propreply, p.Reply, p.Mutex)
 
-
 }
+
+func (r *Replica) dumpDeliveryState(){
+    committedArray := make([]state.Id, 0)
+    readyArray := make([]state.Id, 0)
+
+    for id := range r.cmds {
+        if r.phase[id] == committed {
+            committedArray = append(committedArray, id)
+        }
+        if r.phase[id] == forDelivery {
+            readyArray = append(readyArray, id)
+        }
+    }
+
+    if(len(committedArray) == 0 && len(readyArray) == 0){
+        //fmt.Printf("No commands waiting for delivery\n")
+    } else{
+        if len(committedArray) > 0 {
+            //for _, id := range committedArray{
+                //fmt.Printf("CommittedArray: %d:%v\n", id, r.deps[id])
+            //}
+
+        }
+        if len(readyArray) > 0 {
+            for _, id := range readyArray{
+                fmt.Printf("readyArray: %d:%v\n", id, r.deps[id])
+            }
+
+        }
+    }
+}
+
+
 
 func max(x, y int32) int32 {
     if x > y {
@@ -1072,3 +1224,4 @@ func max(x, y int32) int32 {
     }
     return y
 }
+

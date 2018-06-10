@@ -13,6 +13,7 @@ import (
     "optgpaxosproto"
     "log"
     "math"
+    "fmt"
 )
 
 
@@ -105,7 +106,7 @@ func TestFirstRound(t *testing.T) {
   setup(3, true)
   reps[0].C.proposeChan <- &genericsmr.Propose{createProposal(0, state.PUT, 0, 0), leaderIOChan.Writer, mutex}
   <- control
-  executeFastPath()
+  executeFastPath(true)
 
   reply := new(genericsmrproto.ProposeReplyTS)
   reply.Unmarshal(leaderIOChan.Reader)
@@ -121,7 +122,7 @@ func TestTwoFastRound(t *testing.T) {
    reps[0].C.proposeChan <- &genericsmr.Propose{createProposal(0, state.PUT, 0, 0), leaderIOChan.Writer, mutex}
    <- control
 
-   executeFastPath()
+   executeFastPath(true)
 
    reply := new(genericsmrproto.ProposeReplyTS)
    reply.Unmarshal(leaderIOChan.Reader)
@@ -133,7 +134,7 @@ func TestTwoFastRound(t *testing.T) {
    reps[0].C.proposeChan <- &genericsmr.Propose{createProposal(1, state.PUT, 1, 1), leaderIOChan.Writer, mutex}
    <- control
 
-   executeFastPath()
+   executeFastPath(true)
 
    reply = new(genericsmrproto.ProposeReplyTS)
    reply.Unmarshal(leaderIOChan.Reader)
@@ -150,7 +151,7 @@ func TestNFastRound(t *testing.T) {
         reps[0].C.proposeChan <- &genericsmr.Propose{createProposal(int32(i), state.PUT, state.Key(i), int64(i)), leaderIOChan.Writer, mutex}
         <- control
 
-        executeFastPath()
+        executeFastPath(true)
 
         reply := new(genericsmrproto.ProposeReplyTS)
         reply.Unmarshal(leaderIOChan.Reader)
@@ -161,32 +162,32 @@ func TestNFastRound(t *testing.T) {
     }
 }
 
-func TestRepeatedId(t *testing.T) {
-    setup(3, true)
-
-    reps[0].C.proposeChan <- &genericsmr.Propose{createProposal(0, state.PUT, 0, 0), leaderIOChan.Writer, mutex}
-    <- control
-
-    executeFastPath()
-
-    reply := new(genericsmrproto.ProposeReplyTS)
-    reply.Unmarshal(leaderIOChan.Reader)
-    log.Printf("Reply: %v", reply)
-    if reply.OK != 1 {
-        t.Errorf("Failed FAST Round.")
-    }
-
-    reps[0].C.proposeChan <- &genericsmr.Propose{createProposal(0, state.PUT, 0, 0), leaderIOChan.Writer, mutex}
-    <- control
-
-    reply = new(genericsmrproto.ProposeReplyTS)
-    reply.Unmarshal(leaderIOChan.Reader)
-    log.Printf("Reply: %v", reply)
-    if reply.OK != 0 {
-        t.Errorf("Should ignore repeated command")
-    }
-
-}
+//func TestRepeatedId(t *testing.T) {
+//    setup(3, true)
+//
+//    reps[0].C.proposeChan <- &genericsmr.Propose{createProposal(0, state.PUT, 0, 0), leaderIOChan.Writer, mutex}
+//    <- control
+//
+//    executeFastPath(true)
+//
+//    reply := new(genericsmrproto.ProposeReplyTS)
+//    reply.Unmarshal(leaderIOChan.Reader)
+//    log.Printf("Reply: %v", reply)
+//    if reply.OK != 1 {
+//        t.Errorf("Failed FAST Round.")
+//    }
+//
+//    reps[0].C.proposeChan <- &genericsmr.Propose{createProposal(0, state.PUT, 0, 0), leaderIOChan.Writer, mutex}
+//    <- control
+//
+//    reply = new(genericsmrproto.ProposeReplyTS)
+//    reply.Unmarshal(leaderIOChan.Reader)
+//    log.Printf("Reply: %v", reply)
+//    if reply.OK != 0 {
+//        t.Errorf("Should ignore repeated command")
+//    }
+//
+//}
 
 func TestFastRoundReorderNoConflict(t *testing.T) {
     setup(3, true)
@@ -195,7 +196,7 @@ func TestFastRoundReorderNoConflict(t *testing.T) {
     reps[0].C.proposeChan <- &genericsmr.Propose{createProposal(0, state.PUT, 0, 0), leaderIOChan.Writer, mutex}
     <- control
 
-    executeFastPath()
+    executeFastPath(true)
 
     reply := new(genericsmrproto.ProposeReplyTS)
     reply.Unmarshal(leaderIOChan.Reader)
@@ -208,7 +209,7 @@ func TestFastRoundReorderNoConflict(t *testing.T) {
     <- control
 
 
-    fastAccepts1 := make([]fastrpc.Serializable, len(reps))
+    fastAccepts1 := make([]fastrpc.Serializable, fQ)
     for i := 1; i < fQ; i++{
         fastAccepts1[i] = readMessage(int32(i), new(optgpaxosproto.FastAccept))
     }
@@ -216,14 +217,14 @@ func TestFastRoundReorderNoConflict(t *testing.T) {
     reps[0].C.proposeChan <- &genericsmr.Propose{createProposal(2, state.PUT, 2, 2), leaderIOChan.Writer, mutex}
     <- control
 
-    fastAccepts2 := make([]fastrpc.Serializable, len(reps))
-    for i := 1; i < len(reps); i++{
+    fastAccepts2 := make([]fastrpc.Serializable, fQ)
+    for i := 1; i < fQ; i++{
         fastAccepts2[i] = readMessage(int32(i), new(optgpaxosproto.FastAccept))
     }
 
 
     //Mix delivery order:
-    mixedAcceptReplies1 := make([]fastrpc.Serializable, len(reps))
+    mixedAcceptReplies1 := make([]fastrpc.Serializable, fQ)
     mixedAcceptReplies1[1] = processMsgAndGetReply(fastAcceptChan(1), fastAccepts1[1], true, 0, new(optgpaxosproto.FastAcceptReply))
     mixedAcceptReplies1[2] = processMsgAndGetReply(fastAcceptChan(2), fastAccepts2[2], true, 0, new(optgpaxosproto.FastAcceptReply))
 
@@ -231,7 +232,7 @@ func TestFastRoundReorderNoConflict(t *testing.T) {
         processMsg(fastAcceptReplyChan(0), mixedAcceptReplies1[i], true)
     }
 
-    mixedFastAcceptReplies2 := make([]fastrpc.Serializable, len(reps))
+    mixedFastAcceptReplies2 := make([]fastrpc.Serializable, fQ)
     mixedFastAcceptReplies2[1] = processMsgAndGetReply(fastAcceptChan(1), fastAccepts2[1], true, 0, new(optgpaxosproto.FastAcceptReply))
     mixedFastAcceptReplies2[2] = processMsgAndGetReply(fastAcceptChan(2), fastAccepts1[2], true, 0, new(optgpaxosproto.FastAcceptReply))
 
@@ -273,7 +274,6 @@ func TestFastRoundReorderNoConflict(t *testing.T) {
     }
 }
 
-
 func TestFastRoundReorderConflict(t *testing.T) {
     setup(3, true)
     fQ := int(math.Ceil(3*float64(len(reps))/4))
@@ -281,7 +281,7 @@ func TestFastRoundReorderConflict(t *testing.T) {
 
     reps[0].C.proposeChan <- &genericsmr.Propose{createProposal(0, state.PUT, 0, 0), leaderIOChan.Writer, mutex}
     <- control
-    executeFastPath()
+    executeFastPath(true)
 
     reply := new(genericsmrproto.ProposeReplyTS)
     reply.Unmarshal(leaderIOChan.Reader)
@@ -293,7 +293,7 @@ func TestFastRoundReorderConflict(t *testing.T) {
     reps[0].C.proposeChan <- &genericsmr.Propose{createProposal(1, state.PUT, 1, 1), leaderIOChan.Writer, mutex}
     <- control
 
-    fastAccepts1 := make([]fastrpc.Serializable, len(reps))
+    fastAccepts1 := make([]fastrpc.Serializable, fQ)
     for i := 1; i < fQ; i++{
         fastAccepts1[i] = readMessage(int32(i), new(optgpaxosproto.FastAccept))
     }
@@ -301,13 +301,13 @@ func TestFastRoundReorderConflict(t *testing.T) {
     reps[0].C.proposeChan <- &genericsmr.Propose{createProposal(2, state.PUT, 1, 2), leaderIOChan.Writer, mutex}
     <- control
 
-    fastAccepts2 := make([]fastrpc.Serializable, len(reps))
+    fastAccepts2 := make([]fastrpc.Serializable, fQ)
     for i := 1; i < fQ; i++{
         fastAccepts2[i] = readMessage(int32(i), new(optgpaxosproto.FastAccept))
     }
 
     //Mix delivery order:
-    mixedAcceptReplies1 := make([]fastrpc.Serializable, len(reps))
+    mixedAcceptReplies1 := make([]fastrpc.Serializable, fQ)
     mixedAcceptReplies1[1] = processMsgAndGetReply(fastAcceptChan(1), fastAccepts1[1], true, 0, new(optgpaxosproto.FastAcceptReply))
     mixedAcceptReplies1[2] = processMsgAndGetReply(fastAcceptChan(2), fastAccepts2[2], true, 0, new(optgpaxosproto.FastAcceptReply))
 
@@ -315,12 +315,12 @@ func TestFastRoundReorderConflict(t *testing.T) {
         processMsg(fastAcceptReplyChan(0), mixedAcceptReplies1[i], true)
     }
 
-    accepts1 := make([]fastrpc.Serializable, len(reps))
+    accepts1 := make([]fastrpc.Serializable, q)
     for i := 1; i < q; i++{
         accepts1[i] = readMessage(int32(i), new(optgpaxosproto.Accept))
     }
 
-    acceptReplies := make([]fastrpc.Serializable, len(reps))
+    acceptReplies := make([]fastrpc.Serializable, q)
     for i := 1; i < q; i++{
         acceptReplies[i] = processMsgAndGetReply(acceptChan(int32(i)), accepts1[i], true, 0, new(optgpaxosproto.AcceptReply))
     }
@@ -349,35 +349,45 @@ func TestFastRoundReorderConflict(t *testing.T) {
         processMsg(commitChan(int32(i)), commits[i], true)
     }
 
-
+    reps[0].R.dumpDeliveryState()
 
     // Deliver second pair of reordered messages
-    mixedAcceptReplies2 := make([]fastrpc.Serializable, len(reps))
+    mixedAcceptReplies2 := make([]fastrpc.Serializable, fQ)
     mixedAcceptReplies2[1] = processMsgAndGetReply(fastAcceptChan(1), fastAccepts2[1], true, 0, new(optgpaxosproto.FastAcceptReply))
     mixedAcceptReplies2[2] = processMsgAndGetReply(fastAcceptChan(2), fastAccepts1[2], true, 0, new(optgpaxosproto.FastAcceptReply))
 
-    for i := 1; i < len(reps); i++{
+    for i := 1; i < fQ; i++{
         processMsg(fastAcceptReplyChan(0), mixedAcceptReplies2[i], true)
     }
 
-    accepts2 := make([]fastrpc.Serializable, len(reps))
-    for i := 1; i < len(reps); i++{
+    accepts2 := make([]fastrpc.Serializable, q)
+    for i := 1; i < q; i++{
         accepts2[i] = readMessage(int32(i), new(optgpaxosproto.Accept))
     }
 
-    acceptReplies2 := make([]fastrpc.Serializable, len(reps))
-    for i := 1; i < len(reps); i++{
+    acceptReplies2 := make([]fastrpc.Serializable, q)
+    for i := 1; i < q; i++{
         acceptReplies2[i] = processMsgAndGetReply(acceptChan(int32(i)), accepts2[i], true, 0, new(optgpaxosproto.AcceptReply))
     }
 
-    for i := 1; i < len(reps); i++{
+
+    fmt.Printf("Pending commands before accepting command with id 1\n")
+    reps[0].R.dumpDeliveryState()
+
+    for i := 1; i < q; i++{
         processMsg(acceptReplyChan(0), acceptReplies2[i], true)
     }
+
+    //Attention: Master is configured to deliver commands on accept. Not sure this is the best behaviour.
+    fmt.Printf("Pending commands after accepting command with id 1\n")
+    reps[0].R.dumpDeliveryState()
 
     commits2 := make([]fastrpc.Serializable, len(reps))
     for i := 1; i < len(reps); i++{
         commits2[i] = readMessage(int32(i), new(optgpaxosproto.Commit))
     }
+
+
 
     for i := 1; i < len(reps); i++{
         processMsg(commitChan(int32(i)), commits2[i], true)
@@ -405,7 +415,7 @@ func TestFastRoundMsgNoConflict5Replicas(t *testing.T) {
 
     reps[0].C.proposeChan <- &genericsmr.Propose{createProposal(0, state.PUT, 0, 0), leaderIOChan.Writer, mutex}
     <-control
-    executeFastPath()
+    executeFastPath(false)
 
     reply := new(genericsmrproto.ProposeReplyTS)
     reply.Unmarshal(leaderIOChan.Reader)
@@ -486,13 +496,67 @@ func TestFastRoundMsgNoConflict5Replicas(t *testing.T) {
     }
 }
 
+func TestNewLeadership(t *testing.T) {
+    setup(5, false)
+
+    reps[0].C.proposeChan <- &genericsmr.Propose{createProposal(0, state.PUT, 0, 0), leaderIOChan.Writer, mutex}
+    <-control
+    executeFastPath(false)
+
+    reply := new(genericsmrproto.ProposeReplyTS)
+    reply.Unmarshal(leaderIOChan.Reader)
+    log.Printf("Reply: %v", reply)
+    if reply.OK != 1 {
+        t.Errorf("Failed Classic Round.")
+    }
+
+    reps[1].R.BeTheLeader(nil, nil)
+
+    //change order in vector, to make cycles easy
+    repsTmp := reps[0]
+    reps[0] = reps[1]
+    reps[1] = repsTmp
+
+    connectionsTmp := connections[0]
+    connections[0] = connections[1]
+    connections[1] = connectionsTmp
+
+    newLeader := make([]fastrpc.Serializable, len(reps))
+    for i := 1; i < len(reps); i++{
+        newLeader[i] = readMessage(int32(i), new(optgpaxosproto.NewLeader))
+    }
+
+    newLeaderReplies := make([]fastrpc.Serializable, len(reps))
+    for i := 1; i < len(reps); i++{
+        newLeaderReplies[i] = processMsgAndGetReply(newLeaderChan(int32(i)), newLeader[i], true, 0, new(optgpaxosproto.NewLeaderReply))
+    }
+
+    for i := 1; i < len(reps); i++{
+        processMsg(newLeaderReplyChan(0), newLeaderReplies[i], true)
+    }
+
+    syncMsg := make([]fastrpc.Serializable, len(reps))
+    for i := 1; i < len(reps); i++{
+        syncMsg[i] = readMessage(int32(i), new(optgpaxosproto.Sync))
+    }
+
+    syncReplies := make([]fastrpc.Serializable, len(reps))
+    for i := 1; i < len(reps); i++{
+        syncReplies[i] = processMsgAndGetReply(syncChan(int32(i)), syncMsg[i], true, 0, new(optgpaxosproto.SyncReply))
+    }
+
+    for i := 1; i < len(reps); i++{
+        processMsg(syncReplyChan(0), syncReplies[i], true)
+    }
+
+}
+
+//TODO: Test new leader with pending commands
+
+//TODO: Test collision recovery with 5 replicas
 
 
-//Test collision recovery with larger quorum
-
-//Test delivery order
-
-func executeFastPath(){
+func executeFastPath(thrifty bool){
     fastAccepts := make([]fastrpc.Serializable, len(reps))
 
     fQ := int(math.Ceil(3*float64(len(reps))/4))
@@ -545,15 +609,7 @@ func readMessage(rId int32, msg fastrpc.Serializable ) fastrpc.Serializable {
 func createProposal(id int32, op state.Operation, k state.Key, ts int64) *genericsmrproto.Propose {
     value := make([]byte, 4)
     rand.Read(value)
-    return &genericsmrproto.Propose{id,state.Command{op, k, value},ts}
-}
-
-func prepareChan(rId int32) chan fastrpc.Serializable {
-    return reps[rId].C.prepareChan
-}
-
-func prepareReplyChan(rId int32) chan fastrpc.Serializable {
-    return reps[rId].C.prepareReplyChan
+    return &genericsmrproto.Propose{CommandId: id, Command: state.Command{Op: op, K: k, V: value}, Timestamp: ts}
 }
 
 func acceptChan(rId int32) chan fastrpc.Serializable {
@@ -576,8 +632,18 @@ func commitChan(rId int32) chan fastrpc.Serializable {
     return reps[rId].C.commitChan
 }
 
+func newLeaderChan(rId int32) chan fastrpc.Serializable {
+    return reps[rId].C.newLeaderChan
+}
+
+func newLeaderReplyChan(rId int32) chan fastrpc.Serializable {
+    return reps[rId].C.newLeaderReplyChan
+}
+
 func syncChan(rId int32) chan fastrpc.Serializable {
     return reps[rId].C.syncChan
 }
 
-
+func syncReplyChan(rId int32) chan fastrpc.Serializable {
+    return reps[rId].C.syncReplyChan
+}
