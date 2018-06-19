@@ -681,22 +681,26 @@ func (r *Replica) bcastSync(ballot int32) {
 
 
 func (r *Replica) handleNewLeader(newLeader *optgpaxosproto.NewLeader){
+    var nlreply *optgpaxosproto.NewLeaderReply
     if(r.bal >= newLeader.Ballot ){
-        return
+        nlreply = &optgpaxosproto.NewLeaderReply{newLeader.LeaderId, r.Id, r.bal, r.cbal, *getFullCommands(r.cmds, r.deps, r.phase)}
+    } else{
+        r.maxRecvBallot = max(newLeader.Ballot, r.maxRecvBallot)
+        r.status = preparing
+        r.bal = newLeader.Ballot
+        nlreply = &optgpaxosproto.NewLeaderReply{newLeader.LeaderId, r.Id, newLeader.Ballot, r.cbal, *getFullCommands(r.cmds, r.deps, r.phase)}
     }
 
-    r.maxRecvBallot = max(newLeader.Ballot, r.maxRecvBallot)
 
-    r.status = preparing
-    r.bal = newLeader.Ballot
-
-    nlreply := &optgpaxosproto.NewLeaderReply{newLeader.LeaderId, r.Id, newLeader.Ballot, r.cbal, *getFullCommands(r.cmds, r.deps, r.phase)}
     r.replyNewLeader(newLeader.LeaderId, nlreply)
 
 }
 
 func (r *Replica) handleNewLeaderReply(nlReply *optgpaxosproto.NewLeaderReply){
     if(r.status != preparing || r.bal != nlReply.Ballot ){
+        if(r.bal < nlReply.Ballot){
+            r.revokeLeader()
+        }
         return
     }
 
