@@ -83,21 +83,11 @@ func TestInitFastRound(t *testing.T) {
     reps[0].C.proposeChan <- &genericsmr.Propose{createProposal(0, state.PUT, 0, 0), leaderIOChan.Writer, mutex}
     <- control
 
-    fastAccepts := make([]optgpaxosproto.FastAccept, len(reps))
     for i := 1; i < len(reps); i++{
         msg :=  &optgpaxosproto.FastAccept{}
         code := make([]byte,1)
         connections[int32(i)].is.Read(code)
         msg.Unmarshal(connections[int32(i)].is)
-    }
-
-    for _, p := range fastAccepts{
-        if p.Ballot != 0 {
-            t.Errorf("Wrong ballot number.")
-        }
-        if p.LeaderId!= 0{
-            t.Errorf("Wrong leader id.")
-        }
     }
 
 }

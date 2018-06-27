@@ -404,7 +404,7 @@ func (r *Replica) messageLoop(control chan bool) {
         case fastAcceptC := <-r.fastAcceptChan:
             fastAccept := fastAcceptC.(*optgpaxosproto.FastAccept)
             //got an Accept message
-            dlog.Printf("%d: Received FastAccept from replica %d, for ballot %d with id %d\n", r.Id, fastAccept.LeaderId, fastAccept.Ballot, fastAccept.Id)
+            dlog.Printf("%d: Received FastAccept from replica %d with id %d\n", r.Id, fastAccept.LeaderId, fastAccept.Id)
             r.handleFastAccept(fastAccept)
             sendControl(control)
             break
@@ -625,8 +625,8 @@ func (r *Replica) bcast(quorum int, channel uint8, msg fastrpc.Serializable) {
 
 }
 
-func (r *Replica) bcastFastAccept(ballot int32, id state.Id, cmd []state.Command) {
-    args := &optgpaxosproto.FastAccept{ LeaderId: r.Id, Ballot: ballot, Id: id, Cmd: cmd}
+func (r *Replica) bcastFastAccept(id state.Id, cmd []state.Command) {
+    args := &optgpaxosproto.FastAccept{ LeaderId: r.Id, Id: id, Cmd: cmd}
 
     n := r.N
     if r.Thrifty {
@@ -840,11 +840,9 @@ func (r *Replica) handlePropose(propose *genericsmr.Propose) {
         proposals[i] = prop
     }
 
-    ballot := r.makeBallot(false)
-
     r.lb.proposalsById[id] = proposals
 
-    dlog.Printf("Fast round for cmd id: %d, with ballot %d\n", id, ballot)
+    dlog.Printf("Fast round for cmd id: %d\n", id)
 
     // Leader fast accept -- This code can be same function that the acceptor execute + leaderBookKeeping
     // Code simplification could be applied to all methods
@@ -867,7 +865,7 @@ func (r *Replica) handlePropose(propose *genericsmr.Propose) {
     r.recordCommands(r.cmds[id])
     r.sync()
 
-    r.bcastFastAccept(ballot, id, cmds)
+    r.bcastFastAccept(id, cmds)
 
 }
 
@@ -877,29 +875,23 @@ func (r *Replica) handleFastAccept(fastAccept *optgpaxosproto.FastAccept) {
         return
     }
     var fareply *optgpaxosproto.FastAcceptReply
-    r.maxRecvBallot = max(fastAccept.Ballot, r.maxRecvBallot)
     id := fastAccept.Id
 
-    if fastAccept.Ballot < r.bal{
-        fareply = &optgpaxosproto.FastAcceptReply{Ballot: r.bal, OK: FALSE, Id: fastAccept.Id}
-    } else {
-        // FAST FORWARD if fastAccept.ballot > r.currBallot. Should handle it differently?
-        if r.phase[id] == start {
-            var deps []state.Id
-            for _, cmd := range fastAccept.Cmd {
-                deps = append(deps, r.getDeps(cmd)...)
-            }
-            r.phase[id] = fastAcceptMode
-            r.cmds[id] = fastAccept.Cmd
-            r.deps[id] = deps
-            r.bal = fastAccept.Ballot
-            fareply = &optgpaxosproto.FastAcceptReply{Ballot: r.bal, OK: TRUE, Id: id, Cmd: r.cmds[id], Deps: r.deps[id]}
-        } else {
-            dlog.Printf("Id has already started.")
-            fareply = &optgpaxosproto.FastAcceptReply{Ballot: r.bal, OK: FALSE, Id: id, Deps: nil}
+    // FAST FORWARD if fastAccept.ballot > r.currBallot. Should handle it differently?
+    if r.phase[id] == start {
+        var deps []state.Id
+        for _, cmd := range fastAccept.Cmd {
+            deps = append(deps, r.getDeps(cmd)...)
         }
-
+        r.phase[id] = fastAcceptMode
+        r.cmds[id] = fastAccept.Cmd
+        r.deps[id] = deps
+        fareply = &optgpaxosproto.FastAcceptReply{Ballot: r.bal, OK: TRUE, Id: id, Cmd: r.cmds[id], Deps: r.deps[id]}
+    } else {
+        dlog.Printf("Id has already started.")
+        fareply = &optgpaxosproto.FastAcceptReply{Ballot: r.bal, OK: FALSE, Id: id, Deps: nil}
     }
+
 
     if fareply.OK == TRUE {
         r.recordInstanceMetadata(id)

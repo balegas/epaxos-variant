@@ -4,7 +4,6 @@ import "state"
 
 type FastAccept struct {
     LeaderId int32
-    Ballot   int32
     Id		 state.Id
     Cmd  []state.Command
 }
