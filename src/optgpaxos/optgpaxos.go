@@ -281,21 +281,6 @@ func (r *Replica) sync() {
     r.StableStore.Sync()
 }
 
-/* RPC to be called by master */
-
-func (r *Replica) BeTheLeader(args *genericsmrproto.BeTheLeaderArgs, reply *genericsmrproto.BeTheLeaderReply) error {
-    //r.Mutex.Lock()
-    r.status = preparing
-    r.lb = newLeaderBK()
-
-    log.Printf("%d: I am the leader", r.Id)
-    time.Sleep(5 * time.Second) // wait that the connection is actually lost
-    //r.Mutex.Unlock()
-
-    r.bcastNewLeader()
-    return nil
-}
-
 func (r *Replica) revokeLeader(){
     log.Println("No longer leader")
     r.status = follower
@@ -648,7 +633,7 @@ func (r *Replica) bcastNewLeader() {
 
     n := r.N
 
-    r.bcast(n-1, r.fastAcceptRPC, args)
+    r.bcast(n-1, r.newLeaderRPC, args)
 }
 
 func (r *Replica) bcastSync(ballot int32) {
@@ -663,6 +648,19 @@ func (r *Replica) bcastSync(ballot int32) {
     r.bcast(n-1, r.newLeaderReplyRPC, args)
 }
 
+/* RPC to be called by master */
+func (r *Replica) BeTheLeader(args *genericsmrproto.BeTheLeaderArgs, reply *genericsmrproto.BeTheLeaderReply) error {
+    //r.Mutex.Lock()
+    r.status = preparing
+    r.lb = newLeaderBK()
+
+    log.Printf("%d: I am the leader", r.Id)
+    time.Sleep(5 * time.Second) // wait that the connection is actually lost
+    //r.Mutex.Unlock()
+
+    r.bcastNewLeader()
+    return nil
+}
 
 func (r *Replica) handleNewLeader(newLeader *optgpaxosproto.NewLeader){
     var nlreply *optgpaxosproto.NewLeaderReply
@@ -712,7 +710,7 @@ func (r *Replica) handleNewLeaderReply(nlReply *optgpaxosproto.NewLeaderReply){
     if r.lb.newLeaderOKs[r.bal] >= int(math.Ceil(1*float64(r.N)/2)) {
         log.Printf("Sync STATE")
 
-        //change state to avoid late messagess
+        //change state to avoid late messages
         r.status = waitingSyncReply
         r.lb.syncOKs[r.bal]++
         r.syncState()
