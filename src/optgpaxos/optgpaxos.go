@@ -1114,20 +1114,15 @@ func (r *Replica) handleAcceptReply(areply *optgpaxosproto.AcceptReply) {
 func (r *Replica) executeCommands() {
     for !r.Shutdown {
         r.mutex.Lock()
-        r.dumpDeliveryState()
-        /*executed := */r.tryToDeliverOrExecute(r.Dreply && r.status == leader, true)
+        //r.dumpDeliveryState()
+        r.tryToDeliverOrExecute(r.Dreply && r.status == leader, true)
         r.mutex.Unlock()
-        //Delivers all possible, so sleep everytime
-        //if !executed {
-            time.Sleep(1* time.Second)
-        //}
-
+        time.Sleep(1* time.Second)
     }
-
 }
 
 func (r *Replica) tryToDeliverOrExecute(deliver bool, execute bool) bool{
-    //TODO: IMPORTANT: Very unefficient code.
+    //TODO: IMPORTANT: Make this code more efficient.
     anyDelivered := true
     atLeastOne := false
     for anyDelivered {
