@@ -892,6 +892,7 @@ func (r *Replica) handleFastAccept(fastAccept *optgpaxosproto.FastAccept) {
 
     //dlog.Printf("%d Response for %d :  %d, %+v", r.Id, fastAccept.Id, fareply.OK, fareply.Deps)
     r.replyFastAccept(fastAccept.LeaderId, fareply)
+    //TODO: send message to clients
 }
 
 //TODO: Different from algorithm: accepts b > bal.
@@ -921,9 +922,10 @@ func (r *Replica) handleAccept(accept *optgpaxosproto.Accept) {
         r.recordCommands(accept.Cmd)
         r.sync()
         r.replyAccept(accept.LeaderId, areply)
+        //TODO: send message to clients? Algorithm does not specify the behaviour on client
     }
 
-    //Not replying if NOK
+    //TODO: Not replying if NOK. Could reply in case there is new leader.
 }
 
 func (r *Replica) handleCommit(commit *optgpaxosproto.Commit) {
@@ -1030,6 +1032,7 @@ func (r *Replica) handleFastAcceptReply(areply *optgpaxosproto.FastAcceptReply) 
         if r.lb.fastAcceptOKs[id] >= int(math.Ceil(3*float64(r.N)/4)) {
             r.phase[id] = committed
             r.bcastCommit(r.bal, id, r.cmds[id], r.deps[id])
+            //TODO: send message to clients
 
             //TODO: I am not sure if the code for executing the command immediately is correct.
             if r.lb.proposalsById[id] != nil && !r.Dreply {
@@ -1080,6 +1083,7 @@ func (r *Replica) handleAcceptReply(areply *optgpaxosproto.AcceptReply) {
             dlog.Printf("Moved to commit after Recovery")
             r.phase[id] = committed
             r.bcastCommit(r.bal, id, r.cmds[id], r.deps[id])
+            //TODO: send message to clients
 
             if r.lb.proposalsById[id] != nil && !r.Dreply {
                 r.tryToDeliverOrExecute(!r.Dreply, false)
