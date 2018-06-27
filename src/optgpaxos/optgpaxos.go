@@ -491,19 +491,6 @@ func (r *Replica) makeBallot(forceNew bool) int32 {
     return r.bal
 }
 
-//func (r *Replica) updateCommittedUpTo() {
-//   for r.instanceSpace[r.committedUpTo+1] != nil{
-//       if r.instanceSpace[r.committedUpTo+1].status == FINISHED || r.instanceSpace[r.committedUpTo+1].status == FAST_ACCEPT {
-//           r.committedUpTo++
-//       }
-//   }
-//   dlog.Printf("%d Committed up to %d", r.Id, r.committedUpTo)
-//}
-
-
-
-// Gets dependencies from previous instances and current instance.
-//Splitting commands over multiple paxos instances could reduces the cost of this step.
 func (r *Replica) getDeps(cmd state.Command) []state.Id {
     deps := make([]state.Id, 0)
     for id, other := range r.cmds {
@@ -512,6 +499,17 @@ func (r *Replica) getDeps(cmd state.Command) []state.Id {
         }
     }
     return deps
+}
+
+
+//TODO: Please review this
+func isConflicting(cmd state.Command, otherCmds []state.Command) bool {
+    for _, other := range otherCmds {
+        if cmd.K == other.K && (cmd.Op == state.PUT || other.Op == state.PUT) {
+            return true
+        }
+    }
+    return false
 }
 
 func (r *Replica) checkDependenciesDelivered(id state.Id, instNo int32) bool {
@@ -523,8 +521,6 @@ func (r *Replica) checkDependenciesDelivered(id state.Id, instNo int32) bool {
                 ret = false
                 failed = fmt.Sprintf("Missing %v in instance %d", d, instNo)
                 break
-            } else {
-                ret = true
             }
         }
     }
@@ -534,8 +530,6 @@ func (r *Replica) checkDependenciesDelivered(id state.Id, instNo int32) bool {
     return ret
 }
 
-
-//TODO store dependencies ordered to improve performance
 func depsEqual(first, second []state.Id) bool{
     allEqual := true
     if len(first) != len(second) {
@@ -557,16 +551,6 @@ func depsEqual(first, second []state.Id) bool{
         }
     }
     return allEqual
-}
-
-//TODO: Please review this
-func isConflicting(cmd state.Command, otherCmds []state.Command) bool {
-    for _, other := range otherCmds {
-        if cmd.K == other.K && (cmd.Op == state.PUT || other.Op == state.PUT) {
-            return true
-        }
-    }
-    return false
 }
 
 func getFullCommands(cmds map[state.Id][]state.Command,deps map[state.Id][]state.Id, phase map[state.Id]Phase) *state.FullCmds {
@@ -725,7 +709,7 @@ func (r *Replica) handleNewLeaderReply(nlReply *optgpaxosproto.NewLeaderReply){
         }
     }
 
-    if r.lb.newLeaderOKs[r.bal] > int(math.Ceil(1*float64(r.N)/2))-1 {
+    if r.lb.newLeaderOKs[r.bal] >= int(math.Ceil(1*float64(r.N)/2)) {
         log.Printf("Sync STATE")
 
         //change state to avoid late messagess
@@ -765,7 +749,7 @@ func (r *Replica) syncState(){
                     if equal{
                         count++
                     }
-                    if (count > int(math.Ceil(1*float64(r.N)/4))){
+                    if (count >= int(math.Ceil(1*float64(r.N)/4))){
                         syncCmds[id] = c
                         syncDeps[id] = d
                         syncPhase[id] = slowAcceptMode
@@ -870,6 +854,7 @@ func (r *Replica) handlePropose(propose *genericsmr.Propose) {
 }
 
 func (r *Replica) handleFastAccept(fastAccept *optgpaxosproto.FastAccept) {
+    //Leader already accepted the message, so it must not accept it again.
     if r.status == leader && r.cmds[fastAccept.Id] != nil {
         dlog.Printf("I am the leader for this command, I should not handle FAST Accept: %v\n", fastAccept.Id)
         return
@@ -877,7 +862,7 @@ func (r *Replica) handleFastAccept(fastAccept *optgpaxosproto.FastAccept) {
     var fareply *optgpaxosproto.FastAcceptReply
     id := fastAccept.Id
 
-    // FAST FORWARD if fastAccept.ballot > r.currBallot. Should handle it differently?
+    //TODO How to handle repeated message case? Right now sends NOK in case there is a new leader.
     if r.phase[id] == start {
         var deps []state.Id
         for _, cmd := range fastAccept.Cmd {
@@ -911,6 +896,7 @@ func (r *Replica) handleFastAccept(fastAccept *optgpaxosproto.FastAccept) {
     r.replyFastAccept(fastAccept.LeaderId, fareply)
 }
 
+//TODO: Different from algorithm: accepts b > bal.
 func (r *Replica) handleAccept(accept *optgpaxosproto.Accept) {
     if r.status == leader && r.cmds[accept.Id] != nil {
         dlog.Printf("I am the leader for this command, I should not handle FAST Accept: %v\n", accept.Id)
@@ -923,15 +909,13 @@ func (r *Replica) handleAccept(accept *optgpaxosproto.Accept) {
     if accept.Ballot < r.bal{
         areply = &optgpaxosproto.AcceptReply{Ballot: r.bal, OK: FALSE, Id: accept.Id}
     } else {
-        // FAST FORWARD if fastAccept.ballot > r.currBallot. Should we handle it differently?
+        // FAST FORWARD if Accept.ballot > r.currBallot. Should we handle it differently?
         var deps []state.Id
         r.cmds[id] = accept.Cmd
         r.deps[id] = deps
         r.phase[id] = slowAcceptMode
         r.bal = accept.Ballot
         areply = &optgpaxosproto.AcceptReply{Ballot: r.bal, OK: TRUE, Id: id, Cmd: r.cmds[id], Dep: r.deps[id]}
-
-
     }
 
     if areply.OK == TRUE {
@@ -945,13 +929,15 @@ func (r *Replica) handleAccept(accept *optgpaxosproto.Accept) {
 }
 
 func (r *Replica) handleCommit(commit *optgpaxosproto.Commit) {
-    id := commit.Id
-    r.cmds[id] = commit.Cmd
-    r.deps[id] = commit.Deps
-    r.phase[id] = committed
+    if(r.status == leader || r.status == follower ){
+        id := commit.Id
+        r.cmds[id] = commit.Cmd
+        r.deps[id] = commit.Deps
+        r.phase[id] = committed
 
-    r.recordInstanceMetadata(id)
-    r.recordCommands(r.cmds[id])
+        r.recordInstanceMetadata(id)
+        r.recordCommands(r.cmds[id])
+    }
 
 }
 
@@ -995,7 +981,7 @@ func (r *Replica) handleSyncReply(sreply *optgpaxosproto.SyncReply) {
     if sreply.OK == TRUE {
         r.lb.syncOKs[r.bal]++
 
-        if r.lb.syncOKs[r.bal] > int(math.Ceil(1*float64(r.N)/2))-1 {
+        if r.lb.syncOKs[r.bal] >= int(math.Ceil(1*float64(r.N)/2)) {
             dlog.Printf("%d: I am the elected leader", r.Id)
             r.status = leader
             for id, _ := range r.phase{
@@ -1043,7 +1029,7 @@ func (r *Replica) handleFastAcceptReply(areply *optgpaxosproto.FastAcceptReply) 
             r.lb.fastAcceptNOKs[id]++
             //dlog.Printf("Max NOKs : %d, got: %d", int(math.Ceil(1*float64(r.N)/4))-1, r.lb.fastAcceptNOKs[id])
         }
-        if r.lb.fastAcceptOKs[id] > int(math.Ceil(3*float64(r.N)/4))-1 {
+        if r.lb.fastAcceptOKs[id] >= int(math.Ceil(3*float64(r.N)/4)) {
             r.phase[id] = committed
             r.bcastCommit(r.bal, id, r.cmds[id], r.deps[id])
 
@@ -1054,7 +1040,7 @@ func (r *Replica) handleFastAcceptReply(areply *optgpaxosproto.FastAcceptReply) 
 
             r.recordInstanceMetadata(id)
             r.sync() //is this necessary?
-        } else if r.lb.fastAcceptNOKs[areply.Id] > int(math.Ceil(1*float64(r.N)/4)-1){
+        } else if r.lb.fastAcceptNOKs[areply.Id] >= int(math.Ceil(1*float64(r.N)/4)){
             dlog.Printf("Collision recovery: set deps for %d: %+v",areply.Id, r.deps[areply.Id])
             r.phase[id] = slowAcceptMode
             r.lb.acceptOKs[id] = 1
@@ -1139,6 +1125,7 @@ func (r *Replica) tryToDeliverOrExecute(deliver bool, execute bool) bool{
 
                 if allDepsDelivered {
                     r.phase[id] = forDelivery
+                    //Only the leader replies to clients.
                     if !deliver && r.status != leader{
                         r.phase[id] = delivered
                     }
