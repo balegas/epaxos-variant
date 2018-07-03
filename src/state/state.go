@@ -38,7 +38,10 @@ type FullCmds struct {
 	P	[]Phase
 }
 
-type Id int64
+type Id struct {
+	RId int32
+	Counter int32
+}
 type Phase int8
 
 

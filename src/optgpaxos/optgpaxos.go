@@ -149,10 +149,11 @@ func NewReplicaStub(id int, peerAddrList []string, IsLeader bool, thrifty bool, 
     r.Durable = durable
     r.ProposeChan = chans.proposeChan
 
+    r.lb = newLeaderBK()
     if IsLeader {
-        r.lb = newLeaderBK()
         r.status = leader
     }
+
 
     r.registerRPCs()
 
@@ -201,8 +202,9 @@ func NewReplica(id int, peerAddrList []string, isLeader bool, thrifty bool, exec
     }
 
     r.Durable = durable
+
+    r.lb = newLeaderBK()
     if isLeader {
-        r.lb = newLeaderBK()
         r.status = leader
     }
 
@@ -252,7 +254,8 @@ func (r *Replica) recordInstanceMetadata(id state.Id) {
     }
     var b [13]byte
     binary.LittleEndian.PutUint32(b[0:4], uint32(r.bal))
-    binary.LittleEndian.PutUint64(b[4:12], uint64(id))
+    binary.LittleEndian.PutUint32(b[4:8], uint32(id.RId))
+    binary.LittleEndian.PutUint32(b[8:12], uint32(id.Counter))
     b[12] = byte(r.phase[id])
     r.StableStore.Write(b[:])
 }
@@ -476,6 +479,7 @@ func (r *Replica) makeBallot(forceNew bool) int32 {
     return r.bal
 }
 
+//TODO: Avoid iterating through the sequence.
 func (r *Replica) getDeps(cmd state.Command) []state.Id {
     deps := make([]state.Id, 0)
     for id, other := range r.cmds {
@@ -777,12 +781,12 @@ func (r *Replica) syncState(){
 }
 
 func (r *Replica) handlePropose(propose *genericsmr.Propose) {
-    if r.status != leader {
-        dlog.Printf("Not the leader, cannot propose %v\n", propose.CommandId)
-        preply := &genericsmrproto.ProposeReplyTS{OK: FALSE, CommandId: -1, Value: state.NIL()}
-        r.ReplyProposeTS(preply, propose.Reply, propose.Mutex)
-        return
-    }
+    //if r.status != leader {
+    //    dlog.Printf("Not the leader, cannot propose %v\n", propose.CommandId)
+    //    preply := &genericsmrproto.ProposeReplyTS{OK: FALSE, CommandId: -1, Value: state.NIL()}
+    //    r.ReplyProposeTS(preply, propose.Reply, propose.Mutex)
+    //    return
+    //}
 
     dlog.Printf("Handle propose")
 
@@ -794,9 +798,9 @@ func (r *Replica) handlePropose(propose *genericsmr.Propose) {
 
     dlog.Printf("Batched %d", batchSize)
 
-    //TODO: propose.CommandId is not unique. Using seq id (non-idempotent).
+    //TODO: Change id to a pair (ReplicaId,Counter)
     //id := state.Id(propose.CommandId)
-    id := state.Id(r.counter)
+    id := state.Id{r.Id, r.counter}
     r.counter++
     dlog.Printf("ID for command: %d for command %+v", id, propose.Command)
 
@@ -898,7 +902,7 @@ func (r *Replica) handleFastAccept(fastAccept *optgpaxosproto.FastAccept) {
 //TODO: Different from algorithm: accepts b > bal.
 func (r *Replica) handleAccept(accept *optgpaxosproto.Accept) {
     if r.status == leader && r.cmds[accept.Id] != nil {
-        dlog.Printf("I am the leader for this command, I should not handle FAST Accept: %v\n", accept.Id)
+        dlog.Printf("I am the leader for this command, I should not handle Accept: %v\n", accept.Id)
         return
     }
     var areply *optgpaxosproto.AcceptReply
@@ -929,7 +933,6 @@ func (r *Replica) handleAccept(accept *optgpaxosproto.Accept) {
 }
 
 func (r *Replica) handleCommit(commit *optgpaxosproto.Commit) {
-    if(r.status == leader || r.status == follower ){
         id := commit.Id
         r.cmds[id] = commit.Cmd
         r.deps[id] = commit.Deps
@@ -937,8 +940,6 @@ func (r *Replica) handleCommit(commit *optgpaxosproto.Commit) {
 
         r.recordInstanceMetadata(id)
         r.recordCommands(r.cmds[id])
-    }
-
 }
 
 func (r *Replica) handleSync(sync *optgpaxosproto.Sync) {
@@ -1086,7 +1087,7 @@ func (r *Replica) handleAcceptReply(areply *optgpaxosproto.AcceptReply) {
             //TODO: send message to clients
 
             if r.lb.proposalsById[id] != nil && !r.Dreply {
-                r.tryToDeliverOrExecute(!r.Dreply, false)
+                r.tryToDeliverOrExecute(!r.Dreply, true)
             }
 
             r.recordInstanceMetadata(id)
